@@ -1908,18 +1908,18 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     let child_stderr = child.stderr.take();
 
     let stdout_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         if let Some(mut r) = child_stdout {
-            let _ = r.read_to_string(&mut buf);
+            let _ = r.read_to_end(&mut buf);
         }
-        buf
+        String::from_utf8_lossy(&buf).into_owned()
     });
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         if let Some(mut r) = child_stderr {
-            let _ = r.read_to_string(&mut buf);
+            let _ = r.read_to_end(&mut buf);
         }
-        buf
+        String::from_utf8_lossy(&buf).into_owned()
     });
 
     // Poll the child until it exits or timeout fires
