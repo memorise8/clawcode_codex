@@ -21,6 +21,7 @@ pub(crate) enum TransportClient {
 }
 
 impl TransportClient {
+    #[allow(dead_code)]
     pub fn server_name(&self) -> &str {
         match self {
             Self::Stdio(t) => t.server_name(),

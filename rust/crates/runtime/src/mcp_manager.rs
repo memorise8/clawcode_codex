@@ -9,8 +9,7 @@ use crate::mcp_transport::TransportClient;
 use crate::mcp_transport_http::{plain_http_remote_server, HttpTransportClient};
 use crate::mcp_transport_stdio::StdioTransportClient;
 
-pub use crate::mcp_transport_stdio::*;
-pub use crate::mcp_types::*;
+use crate::mcp_types::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolRoute {
@@ -255,12 +254,14 @@ mod tests {
     use crate::mcp::mcp_tool_name;
     use crate::mcp_client::McpClientBootstrap;
 
-    use super::{
-        spawn_mcp_stdio_process, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
+    use crate::mcp_transport_stdio::{spawn_mcp_stdio_process, McpStdioProcess};
+    use crate::mcp_types::{
+        JsonRpcId, JsonRpcRequest, JsonRpcResponse,
         McpInitializeClientInfo, McpInitializeParams, McpInitializeResult, McpInitializeServerInfo,
-        McpListToolsResult, McpReadResourceParams, McpReadResourceResult, McpServerManager,
-        McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
+        McpListToolsResult, McpReadResourceParams, McpReadResourceResult,
+        McpServerManagerError, McpTool, McpToolCallParams,
     };
+    use super::McpServerManager;
 
     fn temp_dir() -> PathBuf {
         let nanos = SystemTime::now()

@@ -8,7 +8,7 @@ mod file_ops;
 mod json;
 mod mcp;
 mod mcp_client;
-mod mcp_stdio;
+mod mcp_manager;
 mod mcp_transport;
 mod mcp_transport_http;
 mod mcp_transport_stdio;
@@ -52,14 +52,16 @@ pub use mcp_client::{
     McpClaudeAiProxyTransport, McpClientAuth, McpClientBootstrap, McpClientTransport,
     McpRemoteTransport, McpSdkTransport, McpStdioTransport,
 };
-pub use mcp_stdio::{
-    spawn_mcp_stdio_process, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
+pub use mcp_types::{
+    JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     ManagedMcpTool, McpInitializeClientInfo, McpInitializeParams, McpInitializeResult,
     McpInitializeServerInfo, McpListResourcesParams, McpListResourcesResult, McpListToolsParams,
     McpListToolsResult, McpReadResourceParams, McpReadResourceResult, McpResource,
-    McpResourceContents, McpServerManager, McpServerManagerError, McpStdioProcess, McpTool,
+    McpResourceContents, McpServerManagerError, McpTool,
     McpToolCallContent, McpToolCallParams, McpToolCallResult, UnsupportedMcpServer,
 };
+pub use mcp_transport_stdio::{spawn_mcp_stdio_process, McpStdioProcess};
+pub use mcp_manager::McpServerManager;
 pub use oauth::{
     clear_oauth_credentials, clear_oauth_credentials_for_provider, code_challenge_s256,
     credentials_path, generate_pkce_pair, generate_state, load_oauth_credentials,
