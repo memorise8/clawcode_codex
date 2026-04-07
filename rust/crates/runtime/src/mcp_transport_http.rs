@@ -47,6 +47,41 @@ pub(crate) fn next_remote_request_id() -> JsonRpcId {
 
 use crate::mcp_transport::default_initialize_params;
 
+/// Send a JSON-RPC request over HTTP and parse the typed response.
+async fn send_jsonrpc_request<TParams: serde::Serialize, TResult: serde::de::DeserializeOwned>(
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    request: &JsonRpcRequest<TParams>,
+) -> Result<JsonRpcResponse<TResult>, String> {
+    let client = reqwest::Client::new();
+    let mut req = client.post(url).header("content-type", "application/json");
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let resp = req
+        .json(request)
+        .send()
+        .await
+        .map_err(|e| format!("{} failed: {e}", request.method))?;
+    resp.json()
+        .await
+        .map_err(|e| format!("{} parse failed: {e}", request.method))
+}
+
+/// Fire-and-forget a JSON-RPC notification over HTTP (no response expected).
+async fn send_jsonrpc_notification(
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    notification: &serde_json::Value,
+) {
+    let client = reqwest::Client::new();
+    let mut req = client.post(url).header("content-type", "application/json");
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let _ = req.json(notification).send().await;
+}
+
 #[derive(Debug)]
 pub(crate) struct HttpTransportClient {
     server_name: String,
@@ -74,8 +109,6 @@ impl HttpTransportClient {
             return Ok(());
         }
 
-        let client = reqwest::Client::new();
-        // initialize
         let init_params = default_initialize_params();
         let init_request = JsonRpcRequest::new(
             next_remote_request_id(),
@@ -89,31 +122,10 @@ impl HttpTransportClient {
                 }
             })),
         );
-        let mut req = client
-            .post(&self.url)
-            .header("content-type", "application/json");
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
-        let resp = req
-            .json(&init_request)
-            .send()
-            .await
-            .map_err(|e| format!("initialize failed: {e}"))?;
-        let _: JsonRpcResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("initialize parse failed: {e}"))?;
+        let _: JsonRpcResponse = send_jsonrpc_request(&self.url, &self.headers, &init_request).await?;
 
-        // notifications/initialized
         let notif = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        let mut req = client
-            .post(&self.url)
-            .header("content-type", "application/json");
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
-        let _ = req.json(&notif).send().await;
+        send_jsonrpc_notification(&self.url, &self.headers, &notif).await;
 
         self.initialized = true;
         Ok(())
@@ -124,22 +136,8 @@ impl HttpTransportClient {
         id: JsonRpcId,
         params: Option<McpListToolsParams>,
     ) -> Result<JsonRpcResponse<McpListToolsResult>, String> {
-        let client = reqwest::Client::new();
         let request = JsonRpcRequest::new(id, "tools/list", params);
-        let mut req = client
-            .post(&self.url)
-            .header("content-type", "application/json");
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
-        let resp = req
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| format!("tools/list failed: {e}"))?;
-        resp.json()
-            .await
-            .map_err(|e| format!("tools/list parse failed: {e}"))
+        send_jsonrpc_request(&self.url, &self.headers, &request).await
     }
 
     pub async fn call_tool(
@@ -147,22 +145,8 @@ impl HttpTransportClient {
         id: JsonRpcId,
         params: McpToolCallParams,
     ) -> Result<JsonRpcResponse<McpToolCallResult>, String> {
-        let client = reqwest::Client::new();
         let request = JsonRpcRequest::new(id, "tools/call", Some(params));
-        let mut req = client
-            .post(&self.url)
-            .header("content-type", "application/json");
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
-        let resp = req
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| format!("tools/call failed: {e}"))?;
-        resp.json()
-            .await
-            .map_err(|e| format!("tools/call parse failed: {e}"))
+        send_jsonrpc_request(&self.url, &self.headers, &request).await
     }
 
     pub async fn shutdown(&mut self) -> Result<(), String> {

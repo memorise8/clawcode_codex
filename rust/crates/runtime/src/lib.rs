@@ -10,6 +10,7 @@ mod mcp;
 mod mcp_client;
 mod mcp_manager;
 mod mcp_transport;
+mod mcp_transport_factory;
 mod mcp_transport_http;
 mod mcp_transport_stdio;
 mod mcp_types;

@@ -2,12 +2,10 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
-use crate::config::{McpTransport, RuntimeConfig, ScopedMcpServerConfig};
+use crate::config::{RuntimeConfig, ScopedMcpServerConfig};
 use crate::mcp::mcp_tool_name;
-use crate::mcp_client::{McpClientBootstrap, McpClientTransport};
 use crate::mcp_transport::TransportClient;
-use crate::mcp_transport_http::{plain_http_remote_server, HttpTransportClient};
-use crate::mcp_transport_stdio::StdioTransportClient;
+use crate::mcp_transport_factory::{build_transport, TransportBuildResult};
 
 use crate::mcp_types::*;
 
@@ -37,45 +35,12 @@ impl McpServerManager {
         let mut unsupported_servers = Vec::new();
 
         for (server_name, server_config) in servers {
-            let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
-            match (&bootstrap.transport, server_config.transport()) {
-                (McpClientTransport::Stdio(_), McpTransport::Stdio) => {
-                    transports.insert(
-                        server_name.clone(),
-                        TransportClient::Stdio(StdioTransportClient::new(
-                            server_name.clone(),
-                            bootstrap,
-                        )),
-                    );
+            match build_transport(server_name, server_config) {
+                TransportBuildResult::Ok(transport) => {
+                    transports.insert(server_name.clone(), transport);
                 }
-                (McpClientTransport::Sse(remote), transport @ McpTransport::Sse)
-                | (McpClientTransport::Http(remote), transport @ McpTransport::Http) => {
-                    match plain_http_remote_server(server_name, transport, remote) {
-                        Ok(server) => {
-                            transports.insert(
-                                server_name.clone(),
-                                TransportClient::Http(HttpTransportClient::new(
-                                    server.name,
-                                    server.url,
-                                    server.headers,
-                                )),
-                            );
-                        }
-                        Err(reason) => unsupported_servers.push(UnsupportedMcpServer {
-                            server_name: server_name.clone(),
-                            transport,
-                            reason,
-                        }),
-                    }
-                }
-                (_, other) => {
-                    unsupported_servers.push(UnsupportedMcpServer {
-                        server_name: server_name.clone(),
-                        transport: other,
-                        reason: format!(
-                            "transport {other:?} is not supported by McpServerManager",
-                        ),
-                    });
+                TransportBuildResult::Unsupported(unsupported) => {
+                    unsupported_servers.push(unsupported);
                 }
             }
         }
