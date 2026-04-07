@@ -1879,6 +1879,8 @@ fn execute_structured_output(input: StructuredOutputInput) -> StructuredOutputRe
 }
 
 fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
+    use std::io::Read as _;
+
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
@@ -1898,25 +1900,49 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
         .spawn()
         .map_err(|error| error.to_string())?;
 
-    // Poll the child in a loop with short sleeps until it exits or timeout fires
+    // Drain stdout/stderr on background threads to prevent pipe buffer deadlock.
+    // If the child produces more output than the OS pipe buffer (~64KB), it will
+    // block on write() until someone reads. Without draining, try_wait() would
+    // spin until timeout and then kill a process that was otherwise healthy.
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
+
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut r) = child_stdout {
+            let _ = r.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut r) = child_stderr {
+            let _ = r.read_to_string(&mut buf);
+        }
+        buf
+    });
+
+    // Poll the child until it exits or timeout fires
     loop {
         match child.try_wait() {
-            Ok(Some(_status)) => {
-                // Child exited — collect output
-                let output = child.wait_with_output().map_err(|e| e.to_string())?;
+            Ok(Some(status)) => {
+                let stdout = stdout_handle.join().unwrap_or_default();
+                let stderr = stderr_handle.join().unwrap_or_default();
                 return Ok(ReplOutput {
                     language: input.language,
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    exit_code: output.status.code().unwrap_or(1),
+                    stdout,
+                    stderr,
+                    exit_code: status.code().unwrap_or(1),
                     duration_ms: started.elapsed().as_millis(),
                 });
             }
             Ok(None) => {
-                // Still running — check timeout
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Reader threads will see EOF after kill and finish
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
                     return Err(format!(
                         "REPL process killed after timeout of {}ms",
                         timeout.as_millis()
