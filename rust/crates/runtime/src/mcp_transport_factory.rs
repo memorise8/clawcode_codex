@@ -1,7 +1,9 @@
 use crate::config::{McpTransport, ScopedMcpServerConfig};
 use crate::mcp_client::{McpClientBootstrap, McpClientTransport};
 use crate::mcp_transport::TransportClient;
-use crate::mcp_transport_http::{plain_http_remote_server, HttpTransportClient};
+use crate::mcp_transport_auth::RemoteTransportConfig;
+use crate::mcp_transport_http::HttpTransportClient;
+use crate::mcp_transport_sse::SseTransportClient;
 use crate::mcp_transport_stdio::StdioTransportClient;
 use crate::mcp_types::UnsupportedMcpServer;
 
@@ -28,12 +30,34 @@ pub(crate) fn build_transport(
                 bootstrap,
             )))
         }
-        (McpClientTransport::Sse(remote), transport @ McpTransport::Sse)
-        | (McpClientTransport::Http(remote), transport @ McpTransport::Http) => {
-            match plain_http_remote_server(server_name, transport, remote) {
-                Ok(server) => TransportBuildResult::Ok(TransportClient::Http(
-                    HttpTransportClient::new(server.name, server.url, server.headers),
-                )),
+        (McpClientTransport::Sse(remote), transport @ McpTransport::Sse) => {
+            match RemoteTransportConfig::from_remote(server_name, remote) {
+                Ok(config) => {
+                    for warning in config.has_unimplemented_features() {
+                        eprintln!("  \x1b[33mMCP server `{server_name}`: {warning}\x1b[0m");
+                    }
+                    TransportBuildResult::Ok(TransportClient::Sse(SseTransportClient::new(
+                        server_name.to_string(),
+                        config,
+                    )))
+                }
+                Err(reason) => TransportBuildResult::Unsupported(UnsupportedMcpServer {
+                    server_name: server_name.to_string(),
+                    transport,
+                    reason,
+                }),
+            }
+        }
+        (McpClientTransport::Http(remote), transport @ McpTransport::Http) => {
+            match RemoteTransportConfig::from_remote(server_name, remote) {
+                Ok(config) => {
+                    for warning in config.has_unimplemented_features() {
+                        eprintln!("  \x1b[33mMCP server `{server_name}`: {warning}\x1b[0m");
+                    }
+                    TransportBuildResult::Ok(TransportClient::Http(
+                        HttpTransportClient::from_config(server_name.to_string(), config),
+                    ))
+                }
                 Err(reason) => TransportBuildResult::Unsupported(UnsupportedMcpServer {
                     server_name: server_name.to_string(),
                     transport,

@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::McpTransport;
-use crate::mcp_client::{McpClientAuth, McpRemoteTransport};
 use crate::mcp_types::*;
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct ManagedMcpRemoteServer {
     pub(crate) name: String,
@@ -12,11 +11,14 @@ pub(crate) struct ManagedMcpRemoteServer {
     pub(crate) headers: BTreeMap<String, String>,
 }
 
+#[cfg(test)]
 pub(crate) fn plain_http_remote_server(
     server_name: &str,
-    transport: McpTransport,
-    remote: &McpRemoteTransport,
+    transport: crate::config::McpTransport,
+    remote: &crate::mcp_client::McpRemoteTransport,
 ) -> Result<ManagedMcpRemoteServer, String> {
+    use crate::config::McpTransport;
+    use crate::mcp_client::McpClientAuth;
     if remote.headers_helper.is_some() {
         return Err(format!(
             "{transport:?} transport with headersHelper is not yet supported by McpServerManager"
@@ -91,11 +93,24 @@ pub(crate) struct HttpTransportClient {
 }
 
 impl HttpTransportClient {
+    #[cfg(test)]
     pub fn new(server_name: String, url: String, headers: BTreeMap<String, String>) -> Self {
         Self {
             server_name,
             url,
             headers,
+            initialized: false,
+        }
+    }
+
+    pub fn from_config(
+        server_name: String,
+        config: crate::mcp_transport_auth::RemoteTransportConfig,
+    ) -> Self {
+        Self {
+            server_name,
+            url: config.url,
+            headers: config.headers,
             initialized: false,
         }
     }
