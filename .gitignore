@@ -1,4 +1,7 @@
 __pycache__/
 archive/
 .omx/
+.omc/
 .clawd-agents/
+.port_sessions/
+**/.claude/sessions/
