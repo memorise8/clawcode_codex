@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -581,7 +582,7 @@ impl McpServerManager {
 
         let client = reqwest::Client::new();
         let request = JsonRpcRequest::new(
-            JsonRpcId::Number(102),
+            next_remote_request_id(),
             "tools/call",
             Some(McpToolCallParams {
                 name: tool_name.to_string(),
@@ -933,6 +934,13 @@ pub fn spawn_mcp_stdio_process(bootstrap: &McpClientBootstrap) -> io::Result<Mcp
     }
 }
 
+/// Global counter for remote JSON-RPC request IDs to avoid collisions.
+static REMOTE_REQUEST_ID: AtomicU64 = AtomicU64::new(1000);
+
+fn next_remote_request_id() -> JsonRpcId {
+    JsonRpcId::Number(REMOTE_REQUEST_ID.fetch_add(1, Ordering::Relaxed))
+}
+
 async fn discover_remote_server_tools(
     server: &ManagedMcpRemoteServer,
 ) -> Result<Vec<ManagedMcpTool>, String> {
@@ -940,7 +948,7 @@ async fn discover_remote_server_tools(
 
         // Send JSON-RPC initialize request
         let init_request = JsonRpcRequest::new(
-            JsonRpcId::Number(100),
+            next_remote_request_id(),
             "initialize",
             Some(serde_json::json!({
                 "protocolVersion": "2025-03-26",
@@ -984,7 +992,7 @@ async fn discover_remote_server_tools(
 
         // Send tools/list request
         let list_request = JsonRpcRequest::new(
-            JsonRpcId::Number(101),
+            next_remote_request_id(),
             "tools/list",
             None::<JsonValue>,
         );

@@ -2959,14 +2959,19 @@ impl CliToolExecutor {
             )
         };
 
-        let rt = new_tool_runtime()?;
-        let response = rt.block_on(async {
-            let mut mgr = manager.lock().map_err(|error| {
-                ToolError::new(format!("failed to lock MCP manager: {error}"))
-            })?;
-            mgr.call_tool(tool_name, arguments)
-                .await
-                .map_err(|error| ToolError::new(format!("MCP tool call failed: {error}")))
+        let manager = Arc::clone(manager);
+        let tool_name = tool_name.to_string();
+        let response = block_on_new_thread(move || {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| ToolError::new(format!("failed to create tokio runtime: {e}")))?;
+            rt.block_on(async {
+                let mut mgr = manager.lock().map_err(|error| {
+                    ToolError::new(format!("failed to lock MCP manager: {error}"))
+                })?;
+                mgr.call_tool(&tool_name, arguments)
+                    .await
+                    .map_err(|error| ToolError::new(format!("MCP tool call failed: {error}")))
+            })
         })?;
 
         if let Some(error) = response.error {
@@ -3066,21 +3071,19 @@ impl CliToolExecutor {
     }
 }
 
-/// Create a new tokio runtime, avoiding nested runtime panics by
-/// spawning a dedicated thread when a runtime is already active.
-fn new_tool_runtime() -> Result<tokio::runtime::Runtime, ToolError> {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        // Already inside a tokio runtime — create a new one on a separate thread
-        std::thread::scope(|s| {
-            s.spawn(|| tokio::runtime::Runtime::new())
-                .join()
-                .map_err(|_| ToolError::new("runtime creation thread panicked".to_string()))?
-                .map_err(|e| ToolError::new(format!("failed to create tokio runtime: {e}")))
-        })
-    } else {
-        tokio::runtime::Runtime::new()
-            .map_err(|e| ToolError::new(format!("failed to create tokio runtime: {e}")))
-    }
+/// Run an async closure on a dedicated thread with its own tokio runtime,
+/// avoiding "Cannot start a runtime from within a runtime" panics when
+/// the caller is already inside a `block_on` context.
+fn block_on_new_thread<F, T>(f: F) -> Result<T, ToolError>
+where
+    F: FnOnce() -> Result<T, ToolError> + Send,
+    T: Send,
+{
+    std::thread::scope(|s| {
+        s.spawn(f)
+            .join()
+            .map_err(|_| ToolError::new("tool runtime thread panicked".to_string()))?
+    })
 }
 
 fn is_mcp_tool(tool_name: &str) -> bool {

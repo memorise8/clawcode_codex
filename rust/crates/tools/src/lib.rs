@@ -1890,30 +1890,43 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     let runtime = resolve_repl_runtime(&input.language)?;
     let started = Instant::now();
 
-    let output = std::thread::scope(|s| {
-        s.spawn(|| {
-            Command::new(runtime.program)
-                .args(runtime.args)
-                .arg(&input.code)
-                .output()
-                .map_err(|error| error.to_string())
-        })
-        .join()
-        .map_err(|_| String::from("REPL thread panicked"))?
-    })?;
+    let mut child = Command::new(runtime.program)
+        .args(runtime.args)
+        .arg(&input.code)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
 
-    let elapsed = started.elapsed();
-    if elapsed > timeout {
-        return Err(format!("REPL process exceeded timeout of {}ms (took {}ms)", timeout.as_millis(), elapsed.as_millis()));
+    // Poll the child in a loop with short sleeps until it exits or timeout fires
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                // Child exited — collect output
+                let output = child.wait_with_output().map_err(|e| e.to_string())?;
+                return Ok(ReplOutput {
+                    language: input.language,
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    exit_code: output.status.code().unwrap_or(1),
+                    duration_ms: started.elapsed().as_millis(),
+                });
+            }
+            Ok(None) => {
+                // Still running — check timeout
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "REPL process killed after timeout of {}ms",
+                        timeout.as_millis()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
     }
-
-    Ok(ReplOutput {
-        language: input.language,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: output.status.code().unwrap_or(1),
-        duration_ms: elapsed.as_millis(),
-    })
 }
 
 struct ReplRuntime {
