@@ -18,7 +18,7 @@ pub use types::{
     MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
-pub use openai_auth::{resolve_openai_auth, OpenAiCredentials};
+pub use openai_auth::{resolve_openai_auth, OpenAiCredentials, OPENAI_CLIENT_ID};
 pub use openai_client::{read_openai_base_url, OpenAiClient, OpenAiMessageStream, ResponsesStream};
 pub use openai_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatChunkChoice,

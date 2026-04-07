@@ -103,7 +103,7 @@ impl Display for ApiError {
                 last_error,
             } => write!(
                 f,
-                "anthropic api failed after {attempts} attempts: {last_error}"
+                "api failed after {attempts} attempts: {last_error}"
             ),
             Self::MissingOpenAiKey => {
                 write!(f, "OPENAI_API_KEY is not set and no saved OpenAI OAuth credentials found")

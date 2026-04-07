@@ -544,7 +544,7 @@ fn run_anthropic_login() -> Result<(), Box<dyn std::error::Error>> {
         println!("Open this URL manually:\n{authorize_url}");
     }
 
-    let callback = wait_for_oauth_callback(callback_port)?;
+    let callback = wait_for_oauth_callback(callback_port, "Claude")?;
     if let Some(error) = callback.error {
         let description = callback
             .error_description
@@ -578,7 +578,7 @@ fn run_anthropic_login() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_openai_login() -> Result<(), Box<dyn std::error::Error>> {
     let oauth_config = runtime::OAuthConfig {
-        client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_string(),
+        client_id: api::OPENAI_CLIENT_ID.to_string(),
         authorize_url: "https://auth.openai.com/oauth/authorize".to_string(),
         token_url: "https://auth.openai.com/oauth/token".to_string(),
         callback_port: Some(4546),
@@ -604,7 +604,7 @@ fn run_openai_login() -> Result<(), Box<dyn std::error::Error>> {
         println!("Open this URL manually:\n{authorize_url}");
     }
 
-    let callback = wait_for_oauth_callback(callback_port)?;
+    let callback = wait_for_oauth_callback(callback_port, "OpenAI Codex")?;
     if let Some(error) = callback.error {
         let description = callback
             .error_description
@@ -718,6 +718,7 @@ fn open_browser(url: &str) -> io::Result<()> {
 
 fn wait_for_oauth_callback(
     port: u16,
+    provider_label: &str,
 ) -> Result<runtime::OAuthCallbackParams, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let (mut stream, _) = listener.accept()?;
@@ -736,9 +737,9 @@ fn wait_for_oauth_callback(
     let callback = parse_oauth_callback_request_target(target)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let body = if callback.error.is_some() {
-        "Claude OAuth login failed. You can close this window."
+        format!("{provider_label} OAuth login failed. You can close this window.")
     } else {
-        "Claude OAuth login succeeded. You can close this window."
+        format!("{provider_label} OAuth login succeeded. You can close this window.")
     };
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -1303,6 +1304,13 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        match self.provider {
+            Provider::Anthropic => self.run_prompt_json_anthropic(input),
+            Provider::OpenAi => self.run_prompt_json_openai(input),
+        }
+    }
+
+    fn run_prompt_json_anthropic(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let client = AnthropicClient::from_auth(resolve_cli_auth_source()?).with_base_url(api::read_base_url());
         let request = MessageRequest {
             model: self.model.clone(),
@@ -1339,6 +1347,62 @@ impl LiveCli {
                     "output_tokens": response.usage.output_tokens,
                     "cache_creation_input_tokens": response.usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": response.usage.cache_read_input_tokens,
+                }
+            })
+        );
+        Ok(())
+    }
+
+    fn run_prompt_json_openai(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let creds = resolve_openai_auth()?;
+        let client = OpenAiClient::new(&creds.access_token)
+            .with_base_url(read_openai_base_url())
+            .with_account_id(creds.account_id);
+        let request = ResponsesRequest {
+            model: self.model.clone(),
+            input: vec![ResponsesInput::Text(input.to_string())],
+            max_output_tokens: None,
+            tools: None,
+            tool_choice: None,
+            instructions: (!self.system_prompt.is_empty()).then(|| self.system_prompt.join("\n\n")),
+            stream: true,
+            store: Some(false),
+            include: None,
+        };
+        let runtime = tokio::runtime::Runtime::new()?;
+        let (text, input_tokens, output_tokens) = runtime.block_on(async {
+            let mut stream = client.stream_responses(&request).await?;
+            let mut text = String::new();
+            let mut input_tokens = 0u32;
+            let mut output_tokens = 0u32;
+            while let Some((event_type, data)) = stream.next_event().await? {
+                match event_type.as_str() {
+                    "response.output_text.delta" => {
+                        if let Some(delta) = data.get("delta").and_then(|d| d.as_str()) {
+                            text.push_str(delta);
+                        }
+                    }
+                    "response.completed" => {
+                        if let Some(response) = data.get("response") {
+                            if let Some(usage) = response.get("usage") {
+                                input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok::<_, api::ApiError>((text, input_tokens, output_tokens))
+        })?;
+        println!(
+            "{}",
+            json!({
+                "message": text,
+                "model": self.model,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
                 }
             })
         );
@@ -2552,9 +2616,16 @@ impl ApiClient for OpenAiRuntimeClient {
                 .into_iter()
                 .filter(|spec| {
                     // ChatGPT backend requires "properties" in object schemas
-                    spec.input_schema
+                    let has_props = spec.input_schema
                         .get("properties")
-                        .is_some_and(|p| p.is_object())
+                        .is_some_and(|p| p.is_object());
+                    if !has_props {
+                        eprintln!(
+                            "\x1b[33mwarning: tool `{}` excluded from OpenAI request (missing properties in schema)\x1b[0m",
+                            spec.name
+                        );
+                    }
+                    has_props
                 })
                 .map(|spec| ResponsesTool {
                     kind: "function".to_string(),
@@ -2564,7 +2635,14 @@ impl ApiClient for OpenAiRuntimeClient {
                 })
                 .collect();
             for mcp in filter_mcp_tools(&self.mcp_tools, self.allowed_tools.as_ref()) {
-                if mcp.input_schema.get("properties").is_some_and(|p| p.is_object()) {
+                if !mcp.input_schema.get("properties").is_some_and(|p| p.is_object()) {
+                    eprintln!(
+                        "\x1b[33mwarning: MCP tool `{}` excluded from OpenAI request (missing properties in schema)\x1b[0m",
+                        mcp.name
+                    );
+                    continue;
+                }
+                {
                     tools.push(ResponsesTool {
                         kind: "function".to_string(),
                         name: mcp.name,
@@ -2881,9 +2959,7 @@ impl CliToolExecutor {
             )
         };
 
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|error| ToolError::new(format!("failed to create tokio runtime: {error}")))?;
-
+        let rt = new_tool_runtime()?;
         let response = rt.block_on(async {
             let mut mgr = manager.lock().map_err(|error| {
                 ToolError::new(format!("failed to lock MCP manager: {error}"))
@@ -2987,6 +3063,23 @@ impl CliToolExecutor {
                 }).to_string())
             }
         }
+    }
+}
+
+/// Create a new tokio runtime, avoiding nested runtime panics by
+/// spawning a dedicated thread when a runtime is already active.
+fn new_tool_runtime() -> Result<tokio::runtime::Runtime, ToolError> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Already inside a tokio runtime — create a new one on a separate thread
+        std::thread::scope(|s| {
+            s.spawn(|| tokio::runtime::Runtime::new())
+                .join()
+                .map_err(|_| ToolError::new("runtime creation thread panicked".to_string()))?
+                .map_err(|e| ToolError::new(format!("failed to create tokio runtime: {e}")))
+        })
+    } else {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| ToolError::new(format!("failed to create tokio runtime: {e}")))
     }
 }
 

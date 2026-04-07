@@ -9,7 +9,7 @@ use crate::error::ApiError;
 
 const OPENAI_OAUTH_PROVIDER_KEY: &str = "openai_oauth";
 const OPENAI_TOKEN_EXCHANGE_URL: &str = "https://auth.openai.com/oauth/token";
-const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 /// Credentials resolved from OpenAI auth sources.
 #[derive(Clone)]
@@ -79,7 +79,7 @@ fn resolve_saved_openai_oauth(token_set: OAuthTokenSet) -> Result<Option<OpenAiC
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| ApiError::Io(e.into()))?;
     let refreshed = rt.block_on(async {
-        refresh_openai_token_set(&reqwest::Client::new(), &refresh_token, token_set.refresh_token)
+        refresh_openai_token_set(&reqwest::Client::new(), &refresh_token, Some(refresh_token.clone()))
             .await
     })?;
     save_oauth_credentials_for_provider(OPENAI_OAUTH_PROVIDER_KEY, &refreshed)

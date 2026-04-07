@@ -581,7 +581,7 @@ impl McpServerManager {
 
         let client = reqwest::Client::new();
         let request = JsonRpcRequest::new(
-            JsonRpcId::Number(1),
+            JsonRpcId::Number(102),
             "tools/call",
             Some(McpToolCallParams {
                 name: tool_name.to_string(),
@@ -940,14 +940,14 @@ async fn discover_remote_server_tools(
 
         // Send JSON-RPC initialize request
         let init_request = JsonRpcRequest::new(
-            JsonRpcId::Number(1),
+            JsonRpcId::Number(100),
             "initialize",
             Some(serde_json::json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {},
                 "clientInfo": {
                     "name": "claw-code",
-                    "version": "0.1.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             })),
         );
@@ -984,7 +984,7 @@ async fn discover_remote_server_tools(
 
         // Send tools/list request
         let list_request = JsonRpcRequest::new(
-            JsonRpcId::Number(2),
+            JsonRpcId::Number(101),
             "tools/list",
             None::<JsonValue>,
         );

@@ -1764,10 +1764,16 @@ fn cell_kind(cell: &serde_json::Value) -> Option<NotebookCellType> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn execute_sleep(input: SleepInput) -> SleepOutput {
-    std::thread::sleep(Duration::from_millis(input.duration_ms));
+    const MAX_SLEEP_MS: u64 = 60_000;
+    let actual = input.duration_ms.min(MAX_SLEEP_MS);
+    std::thread::sleep(Duration::from_millis(actual));
     SleepOutput {
-        duration_ms: input.duration_ms,
-        message: format!("Slept for {}ms", input.duration_ms),
+        duration_ms: actual,
+        message: if actual < input.duration_ms {
+            format!("Slept for {actual}ms (capped from {}ms)", input.duration_ms)
+        } else {
+            format!("Slept for {actual}ms")
+        },
     }
 }
 
@@ -1876,21 +1882,37 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
-    let _ = input.timeout_ms;
+    const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+    const MAX_TIMEOUT_MS: u64 = 120_000;
+    let timeout = Duration::from_millis(
+        input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS),
+    );
     let runtime = resolve_repl_runtime(&input.language)?;
     let started = Instant::now();
-    let output = Command::new(runtime.program)
-        .args(runtime.args)
-        .arg(&input.code)
-        .output()
-        .map_err(|error| error.to_string())?;
+
+    let output = std::thread::scope(|s| {
+        s.spawn(|| {
+            Command::new(runtime.program)
+                .args(runtime.args)
+                .arg(&input.code)
+                .output()
+                .map_err(|error| error.to_string())
+        })
+        .join()
+        .map_err(|_| String::from("REPL thread panicked"))?
+    })?;
+
+    let elapsed = started.elapsed();
+    if elapsed > timeout {
+        return Err(format!("REPL process exceeded timeout of {}ms (took {}ms)", timeout.as_millis(), elapsed.as_millis()));
+    }
 
     Ok(ReplOutput {
         language: input.language,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.status.code().unwrap_or(1),
-        duration_ms: started.elapsed().as_millis(),
+        duration_ms: elapsed.as_millis(),
     })
 }
 
