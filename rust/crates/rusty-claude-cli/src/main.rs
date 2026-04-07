@@ -4097,4 +4097,50 @@ mod tests {
         assert!(done.contains("Tool `read_file`"));
         assert!(done.contains("contents"));
     }
+
+    #[test]
+    fn provider_default_model_differs_by_provider() {
+        // Regression: run_prompt_json was ignoring provider and always using Anthropic.
+        // This test ensures the Provider enum dispatches correctly.
+        assert_eq!(Provider::Anthropic.default_model(), DEFAULT_MODEL);
+        assert_eq!(Provider::OpenAi.default_model(), "codex-mini-latest");
+        assert_ne!(Provider::Anthropic.default_model(), Provider::OpenAi.default_model());
+    }
+
+    #[test]
+    fn provider_parse_accepts_known_aliases() {
+        assert_eq!(Provider::parse("anthropic").unwrap(), Provider::Anthropic);
+        assert_eq!(Provider::parse("claude").unwrap(), Provider::Anthropic);
+        assert_eq!(Provider::parse("openai").unwrap(), Provider::OpenAi);
+        assert_eq!(Provider::parse("codex").unwrap(), Provider::OpenAi);
+        assert!(Provider::parse("unknown").is_err());
+    }
+
+    #[test]
+    fn provider_flag_selects_correct_default_model() {
+        // Regression: --provider openai must use "codex-mini-latest", not the Anthropic default
+        let action = parse_args(&["--provider".into(), "openai".into()]).unwrap();
+        match action {
+            CliAction::Repl { model, provider, .. } => {
+                assert_eq!(provider, Provider::OpenAi);
+                assert_eq!(model, "codex-mini-latest");
+            }
+            other => panic!("expected Repl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_on_new_thread_avoids_nested_runtime_panic() {
+        // Regression: calling block_on inside an existing tokio runtime panics.
+        // block_on_new_thread must run the closure on a separate thread.
+        let rt = tokio::runtime::Runtime::new().expect("outer runtime");
+        rt.block_on(async {
+            let result = super::block_on_new_thread(|| {
+                let inner_rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| runtime::ToolError::new(e.to_string()))?;
+                inner_rt.block_on(async { Ok(42) })
+            });
+            assert_eq!(result.unwrap(), 42);
+        });
+    }
 }

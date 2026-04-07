@@ -481,6 +481,46 @@ mod tests {
         assert_eq!(token_set.scopes, vec!["model:read", "model:write"]);
         assert!(token_set.expires_at.is_some());
     }
+
+    #[test]
+    fn refresh_accepts_rotated_refresh_token_from_server() {
+        // Regression: the caller was passing the same refresh_token as both
+        // the request token and the fallback, silently discarding any rotated
+        // token the server returned. Now the server's new refresh_token must
+        // be preserved.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read");
+            let body = r#"{"access_token":"new-access","refresh_token":"rotated-refresh","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(), body,
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+
+        let runtime = Builder::new_current_thread().enable_all().build().expect("rt");
+        let token_set = runtime.block_on(async {
+            refresh_openai_token_set_with_url(
+                &reqwest::Client::new(),
+                &format!("http://{addr}/oauth/token"),
+                "old-refresh",
+                Some("old-refresh".to_string()),
+            )
+            .await
+        }).expect("refresh should succeed");
+
+        handle.join().expect("join");
+        assert_eq!(token_set.access_token, "new-access");
+        assert_eq!(
+            token_set.refresh_token.as_deref(),
+            Some("rotated-refresh"),
+            "rotated refresh token from server must be preserved, not the old one"
+        );
+    }
 }
 
 struct CodexTokens {

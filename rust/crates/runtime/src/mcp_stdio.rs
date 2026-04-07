@@ -2217,4 +2217,22 @@ mod tests {
             cleanup_script(&script_path);
         });
     }
+
+    #[test]
+    fn remote_request_ids_are_unique_across_calls() {
+        // Regression: remote JSON-RPC ids were hardcoded constants (1, 2, 102).
+        // Now they use an atomic counter and must be unique.
+        let ids: Vec<JsonRpcId> = (0..10)
+            .map(|_| super::next_remote_request_id())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for id in &ids {
+            match id {
+                JsonRpcId::Number(n) => {
+                    assert!(seen.insert(*n), "duplicate remote request id: {n}");
+                }
+                other => panic!("expected numeric id, got {other:?}"),
+            }
+        }
+    }
 }
