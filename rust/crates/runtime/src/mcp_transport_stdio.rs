@@ -231,3 +231,88 @@ pub(crate) fn encode_frame(payload: &[u8]) -> Vec<u8> {
     framed.extend_from_slice(payload);
     framed
 }
+
+use crate::mcp_transport::default_initialize_params;
+
+#[derive(Debug)]
+pub(crate) struct StdioTransportClient {
+    server_name: String,
+    bootstrap: McpClientBootstrap,
+    process: Option<McpStdioProcess>,
+    initialized: bool,
+}
+
+impl StdioTransportClient {
+    pub fn new(server_name: String, bootstrap: McpClientBootstrap) -> Self {
+        Self {
+            server_name,
+            bootstrap,
+            process: None,
+            initialized: false,
+        }
+    }
+
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+
+    /// Lazily spawn the process and run the MCP initialize handshake.
+    pub async fn ensure_ready(
+        &mut self,
+    ) -> io::Result<JsonRpcResponse<McpInitializeResult>> {
+        if self.process.is_none() {
+            self.process = Some(spawn_mcp_stdio_process(&self.bootstrap)?);
+            self.initialized = false;
+        }
+        if !self.initialized {
+            let process = self.process.as_mut().unwrap();
+            let response = process
+                .initialize(JsonRpcId::Number(0), default_initialize_params())
+                .await?;
+            if response.error.is_none() && response.result.is_some() {
+                self.initialized = true;
+            }
+            return Ok(response);
+        }
+        // Already initialized - return a synthetic success
+        Ok(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: JsonRpcId::Null,
+            result: None,
+            error: None,
+        })
+    }
+
+    pub async fn list_tools(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListToolsParams>,
+    ) -> io::Result<JsonRpcResponse<McpListToolsResult>> {
+        let process = self
+            .process
+            .as_mut()
+            .ok_or_else(|| io::Error::other("process not spawned"))?;
+        process.list_tools(id, params).await
+    }
+
+    pub async fn call_tool(
+        &mut self,
+        id: JsonRpcId,
+        params: McpToolCallParams,
+    ) -> io::Result<JsonRpcResponse<McpToolCallResult>> {
+        let process = self
+            .process
+            .as_mut()
+            .ok_or_else(|| io::Error::other("process not spawned"))?;
+        process.call_tool(id, params).await
+    }
+
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        if let Some(process) = self.process.as_mut() {
+            process.shutdown().await?;
+        }
+        self.process = None;
+        self.initialized = false;
+        Ok(())
+    }
+}

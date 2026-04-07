@@ -9,6 +9,7 @@ mod json;
 mod mcp;
 mod mcp_client;
 mod mcp_stdio;
+mod mcp_transport;
 mod mcp_transport_http;
 mod mcp_transport_stdio;
 mod mcp_types;
