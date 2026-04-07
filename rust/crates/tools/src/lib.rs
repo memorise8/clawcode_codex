@@ -1762,10 +1762,15 @@ fn cell_kind(cell: &serde_json::Value) -> Option<NotebookCellType> {
         })
 }
 
+const MAX_SLEEP_MS: u64 = 60_000;
+
+fn clamp_sleep_duration(requested_ms: u64) -> u64 {
+    requested_ms.min(MAX_SLEEP_MS)
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn execute_sleep(input: SleepInput) -> SleepOutput {
-    const MAX_SLEEP_MS: u64 = 60_000;
-    let actual = input.duration_ms.min(MAX_SLEEP_MS);
+    let actual = clamp_sleep_duration(input.duration_ms);
     std::thread::sleep(Duration::from_millis(actual));
     SleepOutput {
         duration_ms: actual,
@@ -3627,7 +3632,7 @@ printf 'pwsh:%s' "$1"
         }
     }
 
-    use super::{execute_repl, execute_sleep, ReplInput, SleepInput};
+    use super::{clamp_sleep_duration, execute_repl, execute_sleep, ReplInput, SleepInput};
 
     #[test]
     fn repl_kills_hanging_process_on_timeout() {
@@ -3685,9 +3690,16 @@ printf 'pwsh:%s' "$1"
         assert!(!output.message.contains("capped"));
 
         // Verify the cap calculation without actually sleeping 60s:
-        // The cap constant is 60_000. Just check that the message reflects capping.
-        const MAX_SLEEP_MS: u64 = 60_000;
-        let capped = 999_999u64.min(MAX_SLEEP_MS);
+        let capped = clamp_sleep_duration(999_999);
         assert_eq!(capped, 60_000, "cap logic should clamp to 60s");
+    }
+
+    #[test]
+    fn clamp_sleep_duration_caps_at_60s() {
+        assert_eq!(clamp_sleep_duration(0), 0);
+        assert_eq!(clamp_sleep_duration(1000), 1000);
+        assert_eq!(clamp_sleep_duration(60_000), 60_000);
+        assert_eq!(clamp_sleep_duration(60_001), 60_000);
+        assert_eq!(clamp_sleep_duration(u64::MAX), 60_000);
     }
 }

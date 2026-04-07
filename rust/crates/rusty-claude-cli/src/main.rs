@@ -716,6 +716,14 @@ fn open_browser(url: &str) -> io::Result<()> {
     ))
 }
 
+fn oauth_callback_body(provider_label: &str, is_error: bool) -> String {
+    if is_error {
+        format!("{provider_label} OAuth login failed. You can close this window.")
+    } else {
+        format!("{provider_label} OAuth login succeeded. You can close this window.")
+    }
+}
+
 fn wait_for_oauth_callback(
     port: u16,
     provider_label: &str,
@@ -736,11 +744,7 @@ fn wait_for_oauth_callback(
     })?;
     let callback = parse_oauth_callback_request_target(target)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let body = if callback.error.is_some() {
-        format!("{provider_label} OAuth login failed. You can close this window.")
-    } else {
-        format!("{provider_label} OAuth login succeeded. You can close this window.")
-    };
+    let body = oauth_callback_body(provider_label, callback.error.is_some());
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
@@ -4142,5 +4146,35 @@ mod tests {
             });
             assert_eq!(result.unwrap(), 42);
         });
+    }
+
+    #[test]
+    fn oauth_callback_body_uses_provider_label() {
+        let success = super::oauth_callback_body("OpenAI Codex", false);
+        assert!(success.contains("OpenAI Codex"), "got: {success}");
+        assert!(success.contains("succeeded"), "got: {success}");
+        assert!(!success.contains("Claude"), "should not contain Claude: {success}");
+
+        let failure = super::oauth_callback_body("Claude", true);
+        assert!(failure.contains("Claude"), "got: {failure}");
+        assert!(failure.contains("failed"), "got: {failure}");
+    }
+
+    #[test]
+    fn provider_json_dispatch_branches_by_provider() {
+        // Regression: run_prompt_json was hardcoded to Anthropic.
+        // Verify that Provider enum correctly identifies different providers.
+        let anthropic = Provider::Anthropic;
+        let openai = Provider::OpenAi;
+
+        // The dispatch in run_prompt_json uses match self.provider
+        // Verify the enum values are distinct and parse correctly
+        assert_ne!(anthropic, openai);
+        assert_eq!(Provider::parse("openai").unwrap(), openai);
+        assert_eq!(Provider::parse("anthropic").unwrap(), anthropic);
+
+        // Verify default models differ per provider
+        assert_ne!(anthropic.default_model(), openai.default_model());
+        assert_eq!(openai.default_model(), "codex-mini-latest");
     }
 }

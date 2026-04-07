@@ -170,3 +170,63 @@ impl HttpTransportClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp_transport::default_initialize_params;
+
+    #[test]
+    fn default_protocol_version_is_2025() {
+        // Regression: remote server discovery was sending "2024-11-05" while
+        // stdio used "2025-03-26". All transports must use the same version.
+        let params = default_initialize_params();
+        assert_eq!(params.protocol_version, "2025-03-26");
+    }
+
+    #[test]
+    fn remote_request_ids_are_unique() {
+        // Regression: remote JSON-RPC ids were hardcoded constants.
+        let ids: Vec<_> = (0..10).map(|_| next_remote_request_id()).collect();
+        let mut seen = std::collections::HashSet::new();
+        for id in &ids {
+            match id {
+                crate::mcp_types::JsonRpcId::Number(n) => {
+                    assert!(seen.insert(*n), "duplicate id: {n}");
+                }
+                other => panic!("expected numeric id, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn plain_http_rejects_headers_helper() {
+        use crate::mcp_client::McpRemoteTransport;
+        let remote = McpRemoteTransport {
+            url: "http://localhost:8080".to_string(),
+            headers: std::collections::BTreeMap::new(),
+            headers_helper: Some("helper.sh".to_string()),
+            auth: crate::mcp_client::McpClientAuth::None,
+        };
+        let result = plain_http_remote_server("test", crate::config::McpTransport::Http, &remote);
+        assert!(result.is_err(), "headersHelper should be rejected");
+    }
+
+    #[test]
+    fn plain_http_rejects_oauth() {
+        use crate::mcp_client::McpRemoteTransport;
+        let remote = McpRemoteTransport {
+            url: "http://localhost:8080".to_string(),
+            headers: std::collections::BTreeMap::new(),
+            headers_helper: None,
+            auth: crate::mcp_client::McpClientAuth::OAuth(crate::config::McpOAuthConfig {
+                client_id: Some("id".to_string()),
+                callback_port: None,
+                auth_server_metadata_url: None,
+                xaa: None,
+            }),
+        };
+        let result = plain_http_remote_server("test", crate::config::McpTransport::Http, &remote);
+        assert!(result.is_err(), "OAuth should be rejected");
+    }
+}

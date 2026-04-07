@@ -151,3 +151,55 @@ impl From<VarError> for ApiError {
         Self::InvalidApiKeyEnv(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ApiError;
+
+    #[test]
+    fn retries_exhausted_message_is_provider_neutral() {
+        let inner = ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: Some("rate_limit".to_string()),
+            message: Some("slow down".to_string()),
+            body: String::new(),
+            retryable: true,
+        };
+        let error = ApiError::RetriesExhausted {
+            attempts: 3,
+            last_error: Box::new(inner),
+        };
+        let msg = error.to_string();
+        assert!(msg.contains("api failed after 3 attempts"), "got: {msg}");
+        assert!(!msg.contains("anthropic api failed"), "should be provider-neutral: {msg}");
+    }
+
+    #[test]
+    fn openai_api_error_formats_with_type_and_message() {
+        let error = ApiError::OpenAiApi {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: Some("invalid_request".to_string()),
+            message: Some("bad param".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+        let msg = error.to_string();
+        assert!(msg.contains("openai api"), "got: {msg}");
+        assert!(msg.contains("invalid_request"), "got: {msg}");
+        assert!(msg.contains("bad param"), "got: {msg}");
+    }
+
+    #[test]
+    fn anthropic_api_error_formats_with_type_and_message() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            error_type: Some("auth_error".to_string()),
+            message: Some("invalid key".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+        let msg = error.to_string();
+        assert!(msg.contains("anthropic api"), "got: {msg}");
+        assert!(msg.contains("auth_error"), "got: {msg}");
+    }
+}
