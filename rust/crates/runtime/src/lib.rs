@@ -3,6 +3,7 @@ mod bootstrap;
 mod compact;
 mod config;
 mod conversation;
+mod hooks;
 mod file_ops;
 mod json;
 mod mcp;
@@ -33,6 +34,7 @@ pub use conversation::{
     ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, StaticToolExecutor,
     ToolError, ToolExecutor, TurnSummary,
 };
+pub use hooks::{HookOutcome, HookRunner};
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
@@ -55,11 +57,13 @@ pub use mcp_stdio::{
     McpToolCallContent, McpToolCallParams, McpToolCallResult, UnsupportedMcpServer,
 };
 pub use oauth::{
-    clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
-    generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,
-    parse_oauth_callback_request_target, save_oauth_credentials, OAuthAuthorizationRequest,
-    OAuthCallbackParams, OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet,
-    PkceChallengeMethod, PkceCodePair,
+    clear_oauth_credentials, clear_oauth_credentials_for_provider, code_challenge_s256,
+    credentials_path, generate_pkce_pair, generate_state, load_oauth_credentials,
+    load_oauth_credentials_for_provider, loopback_redirect_uri, parse_oauth_callback_query,
+    parse_oauth_callback_request_target, save_oauth_credentials,
+    save_oauth_credentials_for_provider, OAuthAuthorizationRequest, OAuthCallbackParams,
+    OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet, PkceChallengeMethod,
+    PkceCodePair,
 };
 pub use permissions::{
     PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,

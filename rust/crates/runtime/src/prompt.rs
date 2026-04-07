@@ -205,6 +205,7 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
             dir.join("CLAUDE.local.md"),
             dir.join(".claude").join("CLAUDE.md"),
             dir.join(".claude").join("instructions.md"),
+            dir.join("AGENTS.md"),
         ] {
             push_context_file(&mut files, candidate)?;
         }

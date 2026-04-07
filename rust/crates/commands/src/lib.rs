@@ -90,7 +90,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "config",
         summary: "Inspect Claude config files or merged sections",
-        argument_hint: Some("[env|hooks|model]"),
+        argument_hint: Some("[env|hooks|model] or set <key> <value>"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -129,6 +129,18 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: Some("[list|switch <session-id>]"),
         resume_supported: false,
     },
+    SlashCommandSpec {
+        name: "commit",
+        summary: "Create a git commit (delegates to model for message)",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "pr",
+        summary: "Create a pull request (delegates to model for title/body)",
+        argument_hint: None,
+        resume_supported: false,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +163,8 @@ pub enum SlashCommand {
     },
     Config {
         section: Option<String>,
+        set_key: Option<String>,
+        set_value: Option<String>,
     },
     Memory,
     Init,
@@ -163,6 +177,8 @@ pub enum SlashCommand {
         action: Option<String>,
         target: Option<String>,
     },
+    Commit,
+    Pr,
     Unknown(String),
 }
 
@@ -193,9 +209,25 @@ impl SlashCommand {
             "resume" => Self::Resume {
                 session_path: parts.next().map(ToOwned::to_owned),
             },
-            "config" => Self::Config {
-                section: parts.next().map(ToOwned::to_owned),
-            },
+            "config" => {
+                let first = parts.next();
+                match first {
+                    Some("set") => {
+                        let key = parts.next().map(ToOwned::to_owned);
+                        let value: String = parts.collect::<Vec<_>>().join(" ");
+                        Self::Config {
+                            section: None,
+                            set_key: key,
+                            set_value: if value.is_empty() { None } else { Some(value) },
+                        }
+                    }
+                    other => Self::Config {
+                        section: other.map(ToOwned::to_owned),
+                        set_key: None,
+                        set_value: None,
+                    },
+                }
+            }
             "memory" => Self::Memory,
             "init" => Self::Init,
             "diff" => Self::Diff,
@@ -207,6 +239,8 @@ impl SlashCommand {
                 action: parts.next().map(ToOwned::to_owned),
                 target: parts.next().map(ToOwned::to_owned),
             },
+            "commit" => Self::Commit,
+            "pr" => Self::Pr,
             other => Self::Unknown(other.to_string()),
         })
     }
@@ -291,6 +325,8 @@ pub fn handle_slash_command(
         | SlashCommand::Version
         | SlashCommand::Export { .. }
         | SlashCommand::Session { .. }
+        | SlashCommand::Commit
+        | SlashCommand::Pr
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -340,12 +376,22 @@ mod tests {
         );
         assert_eq!(
             SlashCommand::parse("/config"),
-            Some(SlashCommand::Config { section: None })
+            Some(SlashCommand::Config { section: None, set_key: None, set_value: None })
         );
         assert_eq!(
             SlashCommand::parse("/config env"),
             Some(SlashCommand::Config {
-                section: Some("env".to_string())
+                section: Some("env".to_string()),
+                set_key: None,
+                set_value: None,
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/config set model claude-opus-4-6"),
+            Some(SlashCommand::Config {
+                section: None,
+                set_key: Some("model".to_string()),
+                set_value: Some("claude-opus-4-6".to_string()),
             })
         );
         assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
@@ -379,14 +425,14 @@ mod tests {
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config [env|hooks|model]"));
+        assert!(help.contains("/config [env|hooks|model] or set <key> <value>"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
         assert!(help.contains("/session [list|switch <session-id>]"));
-        assert_eq!(slash_command_specs().len(), 15);
+        assert_eq!(slash_command_specs().len(), 17);
         assert_eq!(resume_supported_slash_commands().len(), 11);
     }
 

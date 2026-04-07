@@ -27,6 +27,14 @@ pub enum ApiError {
         attempt: u32,
         base_delay: Duration,
     },
+    MissingOpenAiKey,
+    OpenAiApi {
+        status: reqwest::StatusCode,
+        error_type: Option<String>,
+        message: Option<String>,
+        body: String,
+        retryable: bool,
+    },
 }
 
 impl ApiError {
@@ -35,6 +43,7 @@ impl ApiError {
         match self {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
             Self::Api { retryable, .. } => *retryable,
+            Self::OpenAiApi { retryable, .. } => *retryable,
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
             Self::MissingApiKey
             | Self::ExpiredOAuthToken
@@ -43,7 +52,8 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json(_)
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::MissingOpenAiKey => false,
         }
     }
 }
@@ -95,6 +105,15 @@ impl Display for ApiError {
                 f,
                 "anthropic api failed after {attempts} attempts: {last_error}"
             ),
+            Self::MissingOpenAiKey => {
+                write!(f, "OPENAI_API_KEY is not set and no saved OpenAI OAuth credentials found")
+            }
+            Self::OpenAiApi { status, error_type, message, body, .. } => match (error_type, message) {
+                (Some(error_type), Some(message)) => {
+                    write!(f, "openai api returned {status} ({error_type}): {message}")
+                }
+                _ => write!(f, "openai api returned {status}: {body}"),
+            },
             Self::InvalidSseFrame(message) => write!(f, "invalid sse frame: {message}"),
             Self::BackoffOverflow {
                 attempt,

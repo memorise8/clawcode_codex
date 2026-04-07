@@ -291,6 +291,41 @@ pub fn clear_oauth_credentials() -> io::Result<()> {
     write_credentials_root(&path, &root)
 }
 
+pub fn load_oauth_credentials_for_provider(provider_key: &str) -> io::Result<Option<OAuthTokenSet>> {
+    let path = credentials_path()?;
+    let root = read_credentials_root(&path)?;
+    let Some(value) = root.get(provider_key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let stored = serde_json::from_value::<StoredOAuthCredentials>(value.clone())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(Some(stored.into()))
+}
+
+pub fn save_oauth_credentials_for_provider(
+    provider_key: &str,
+    token_set: &OAuthTokenSet,
+) -> io::Result<()> {
+    let path = credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    root.insert(
+        provider_key.to_string(),
+        serde_json::to_value(StoredOAuthCredentials::from(token_set.clone()))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    );
+    write_credentials_root(&path, &root)
+}
+
+pub fn clear_oauth_credentials_for_provider(provider_key: &str) -> io::Result<()> {
+    let path = credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    root.remove(provider_key);
+    write_credentials_root(&path, &root)
+}
+
 pub fn parse_oauth_callback_request_target(target: &str) -> Result<OAuthCallbackParams, String> {
     let (path, query) = target
         .split_once('?')

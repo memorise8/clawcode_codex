@@ -1295,26 +1295,45 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
     }
-    candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(std::path::PathBuf::from(home).join(".codex").join("skills"));
+    }
 
     for root in candidates {
         let direct = root.join(requested).join("SKILL.md");
         if direct.exists() {
             return Ok(direct);
         }
+        let system = root.join(".system").join(requested).join("SKILL.md");
+        if system.exists() {
+            return Ok(system);
+        }
 
         if let Ok(entries) = std::fs::read_dir(&root) {
             for entry in entries.flatten() {
-                let path = entry.path().join("SKILL.md");
-                if !path.exists() {
-                    continue;
-                }
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(requested)
+                let entry_path = entry.path();
+                let path = entry_path.join("SKILL.md");
+                if path.exists()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(requested)
                 {
                     return Ok(path);
+                }
+
+                if let Ok(nested_entries) = std::fs::read_dir(&entry_path) {
+                    for nested_entry in nested_entries.flatten() {
+                        let nested_path = nested_entry.path().join("SKILL.md");
+                        if nested_path.exists()
+                            && nested_entry
+                                .file_name()
+                                .to_string_lossy()
+                                .eq_ignore_ascii_case(requested)
+                        {
+                            return Ok(nested_path);
+                        }
+                    }
                 }
             }
         }
@@ -2502,6 +2521,9 @@ mod tests {
 
     #[test]
     fn web_search_extracts_and_filters_results() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.contains("GET /search?q=rust+web+search "));
             HttpResponse::html(
@@ -2697,6 +2719,33 @@ mod tests {
 
     #[test]
     fn skill_loads_local_skill_prompt() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("skill-home");
+        let skill_path = root
+            .join(".codex")
+            .join("skills")
+            .join("help")
+            .join("SKILL.md");
+        fs::create_dir_all(skill_path.parent().expect("skill parent")).expect("create skill dir");
+        fs::write(
+            &skill_path,
+            r#"---
+name: help
+description: Synthetic help skill for tests.
+---
+
+Guide on using oh-my-codex plugin
+"#,
+        )
+        .expect("write skill");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        std::env::set_var("HOME", &root);
+        std::env::remove_var("CODEX_HOME");
+
         let result = execute_tool(
             "Skill",
             &json!({
@@ -2711,7 +2760,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
-            .ends_with("/help/SKILL.md"));
+            .ends_with("/.codex/skills/help/SKILL.md"));
         assert!(output["prompt"]
             .as_str()
             .expect("prompt")
@@ -2731,6 +2780,16 @@ mod tests {
             .as_str()
             .expect("path")
             .ends_with("/help/SKILL.md"));
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3463,7 +3522,7 @@ printf 'pwsh:%s' "$1"
                 let _ = tx.send(());
             }
             if let Some(handle) = self.handle.take() {
-                handle.join().expect("join test server");
+                let _ = handle.join();
             }
         }
     }

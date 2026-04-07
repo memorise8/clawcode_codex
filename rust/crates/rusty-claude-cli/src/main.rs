@@ -9,12 +9,18 @@ use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+};
+use api::{
+    resolve_openai_auth, read_openai_base_url, OpenAiClient,
+    ResponsesRequest, ResponsesInput, ResponsesMessage, ResponsesContent, ResponsesTool,
+    ResponsesFunctionCallInput, ResponsesFunctionCallOutputInput,
 };
 
 use commands::{
@@ -24,12 +30,14 @@ use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use render::{Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
-    parse_oauth_callback_request_target, save_oauth_credentials, ApiClient, ApiRequest,
+    clear_oauth_credentials, clear_oauth_credentials_for_provider, generate_pkce_pair,
+    generate_state, load_system_prompt, parse_oauth_callback_request_target,
+    save_oauth_credentials, save_oauth_credentials_for_provider, ApiClient, ApiRequest,
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest,
-    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    ConversationMessage, ConversationRuntime, McpServerManager, MessageRole,
+    OAuthAuthorizationRequest, OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy,
+    ProjectContext, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    compact_session, should_compact,
 };
 use serde_json::json;
 use tools::{execute_tool, mvp_tool_specs, ToolSpec};
@@ -42,7 +50,40 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    Anthropic,
+    OpenAi,
+}
+
+impl Provider {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "anthropic" | "claude" => Ok(Self::Anthropic),
+            "openai" | "codex" => Ok(Self::OpenAi),
+            other => Err(format!(
+                "unsupported provider: {other} (expected: anthropic, claude, openai, codex)"
+            )),
+        }
+    }
+
+    fn default_model(&self) -> &'static str {
+        match self {
+            Self::Anthropic => DEFAULT_MODEL,
+            Self::OpenAi => "codex-mini-latest",
+        }
+    }
+}
+
 type AllowedToolSet = BTreeSet<String>;
+
+/// A tool specification discovered from an MCP server, ready to be sent to the model.
+#[derive(Debug, Clone)]
+struct McpToolSpec {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -72,16 +113,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, false, allowed_tools, permission_mode)?
+            provider,
+        } => LiveCli::new(model, true, allowed_tools, permission_mode, provider)?
             .run_turn_with_output(&prompt, output_format)?,
-        CliAction::Login => run_login()?,
-        CliAction::Logout => run_logout()?,
+        CliAction::Login { provider } => run_login(provider)?,
+        CliAction::Logout { provider } => run_logout(provider)?,
         CliAction::Init => run_init()?,
         CliAction::Repl {
             model,
             allowed_tools,
             permission_mode,
-        } => run_repl(model, allowed_tools, permission_mode)?,
+            provider,
+        } => run_repl(model, allowed_tools, permission_mode, provider)?,
         CliAction::Help => print_help(),
     }
     Ok(())
@@ -106,14 +149,20 @@ enum CliAction {
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        provider: Provider,
     },
-    Login,
-    Logout,
+    Login {
+        provider: Provider,
+    },
+    Logout {
+        provider: Provider,
+    },
     Init,
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        provider: Provider,
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help,
@@ -140,6 +189,8 @@ impl CliOutputFormat {
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = DEFAULT_MODEL.to_string();
+    let mut model_explicitly_set = false;
+    let mut provider = Provider::Anthropic;
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode = default_permission_mode();
     let mut wants_version = false;
@@ -158,10 +209,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
                 model.clone_from(value);
+                model_explicitly_set = true;
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
                 model = flag[8..].to_string();
+                model_explicitly_set = true;
                 index += 1;
             }
             "--output-format" => {
@@ -201,11 +254,26 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 allowed_tool_values.push(flag[16..].to_string());
                 index += 1;
             }
+            "--provider" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --provider".to_string())?;
+                provider = Provider::parse(value)?;
+                index += 2;
+            }
+            flag if flag.starts_with("--provider=") => {
+                provider = Provider::parse(&flag[11..])?;
+                index += 1;
+            }
             other => {
                 rest.push(other.to_string());
                 index += 1;
             }
         }
+    }
+
+    if !model_explicitly_set {
+        model = provider.default_model().to_string();
     }
 
     if wants_version {
@@ -219,6 +287,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
+            provider,
         });
     }
     if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
@@ -232,8 +301,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "dump-manifests" => Ok(CliAction::DumpManifests),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
-        "login" => Ok(CliAction::Login),
-        "logout" => Ok(CliAction::Logout),
+        "login" => Ok(CliAction::Login { provider }),
+        "logout" => Ok(CliAction::Logout { provider }),
         "init" => Ok(CliAction::Init),
         "prompt" => {
             let prompt = rest[1..].join(" ");
@@ -246,6 +315,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
                 allowed_tools,
                 permission_mode,
+                provider,
             })
         }
         other if !other.starts_with('/') => Ok(CliAction::Prompt {
@@ -254,6 +324,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
+            provider,
         }),
         other => Err(format!("unknown subcommand: {other}")),
     }
@@ -289,10 +360,14 @@ fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, 
             .split(|ch: char| ch == ',' || ch.is_whitespace())
             .filter(|token| !token.is_empty())
         {
+            if token.starts_with("mcp__") {
+                allowed.insert(token.to_string());
+                continue;
+            }
             let normalized = normalize_tool_name(token);
             let canonical = name_map.get(&normalized).ok_or_else(|| {
                 format!(
-                    "unsupported tool in --allowedTools: {token} (expected one of: {})",
+                    "unsupported tool in --allowedTools: {token} (expected one of: {} or an exact mcp__server__tool name)",
                     canonical_names.join(", ")
                 )
             })?;
@@ -339,6 +414,35 @@ fn filter_tool_specs(allowed_tools: Option<&AllowedToolSet>) -> Vec<tools::ToolS
         .into_iter()
         .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
         .collect()
+}
+
+fn filter_mcp_tools(
+    mcp_tools: &[McpToolSpec],
+    allowed_tools: Option<&AllowedToolSet>,
+) -> Vec<McpToolSpec> {
+    mcp_tools
+        .iter()
+        .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(&spec.name)))
+        .cloned()
+        .collect()
+}
+
+fn child_allowed_tools(allowed_tools: Option<&AllowedToolSet>) -> Option<AllowedToolSet> {
+    match allowed_tools {
+        Some(allowed) => {
+            let mut child = allowed.clone();
+            child.remove("Agent");
+            child.remove("Skill");
+            Some(child)
+        }
+        None => Some(
+            mvp_tool_specs()
+                .into_iter()
+                .filter(|spec| spec.name != "Agent" && spec.name != "Skill")
+                .map(|spec| spec.name.to_string())
+                .collect(),
+        ),
+    }
 }
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
@@ -409,7 +513,14 @@ fn print_bootstrap_plan() {
     }
 }
 
-fn run_login() -> Result<(), Box<dyn std::error::Error>> {
+fn run_login(provider: Provider) -> Result<(), Box<dyn std::error::Error>> {
+    match provider {
+        Provider::Anthropic => run_anthropic_login(),
+        Provider::OpenAi => run_openai_login(),
+    }
+}
+
+fn run_anthropic_login() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let config = ConfigLoader::default_for(&cwd).load()?;
     let oauth = config.oauth().ok_or_else(|| {
@@ -465,9 +576,122 @@ fn run_login() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_logout() -> Result<(), Box<dyn std::error::Error>> {
-    clear_oauth_credentials()?;
-    println!("Claude OAuth credentials cleared.");
+fn run_openai_login() -> Result<(), Box<dyn std::error::Error>> {
+    let oauth_config = runtime::OAuthConfig {
+        client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_string(),
+        authorize_url: "https://auth.openai.com/oauth/authorize".to_string(),
+        token_url: "https://auth.openai.com/oauth/token".to_string(),
+        callback_port: Some(4546),
+        manual_redirect_url: None,
+        scopes: vec![],
+    };
+    let callback_port = oauth_config.callback_port.unwrap_or(4546);
+    let redirect_uri = runtime::loopback_redirect_uri(callback_port);
+    let pkce = generate_pkce_pair()?;
+    let state = generate_state()?;
+    let authorize_url = OAuthAuthorizationRequest::from_config(
+        &oauth_config,
+        redirect_uri.clone(),
+        state.clone(),
+        &pkce,
+    )
+    .build_url();
+
+    println!("Starting OpenAI Codex OAuth login...");
+    println!("Listening for callback on {redirect_uri}");
+    if let Err(error) = open_browser(&authorize_url) {
+        eprintln!("warning: failed to open browser automatically: {error}");
+        println!("Open this URL manually:\n{authorize_url}");
+    }
+
+    let callback = wait_for_oauth_callback(callback_port)?;
+    if let Some(error) = callback.error {
+        let description = callback
+            .error_description
+            .unwrap_or_else(|| "authorization failed".to_string());
+        return Err(io::Error::other(format!("{error}: {description}")).into());
+    }
+    let code = callback.code.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "callback did not include code")
+    })?;
+    let returned_state = callback.state.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "callback did not include state")
+    })?;
+    if returned_state != state {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "oauth state mismatch").into());
+    }
+
+    let http = reqwest::Client::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let token_response: serde_json::Value = rt.block_on(async {
+        let form = [
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", &redirect_uri),
+            ("code_verifier", &pkce.verifier),
+            ("client_id", &oauth_config.client_id),
+        ];
+        let response = http.post(&oauth_config.token_url)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(io::Error::other(format!("token exchange failed ({status}): {body}")));
+        }
+        response.json().await.map_err(|e| io::Error::other(e.to_string()))
+    })?;
+
+    let access_token = token_response
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing access_token in response",
+            )
+        })?;
+    let refresh_token = token_response
+        .get("refresh_token")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let expires_at = token_response
+        .get("expires_in")
+        .and_then(serde_json::Value::as_u64)
+        .map(|secs| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + secs
+        });
+
+    save_oauth_credentials_for_provider(
+        "openai_oauth",
+        &runtime::OAuthTokenSet {
+            access_token: access_token.to_string(),
+            refresh_token,
+            expires_at,
+            scopes: vec![],
+        },
+    )?;
+    println!("OpenAI Codex OAuth login complete.");
+    Ok(())
+}
+
+fn run_logout(provider: Provider) -> Result<(), Box<dyn std::error::Error>> {
+    match provider {
+        Provider::Anthropic => {
+            clear_oauth_credentials()?;
+            println!("Claude OAuth credentials cleared.");
+        }
+        Provider::OpenAi => {
+            clear_oauth_credentials_for_provider("openai_oauth")?;
+            println!("OpenAI Codex OAuth credentials cleared.");
+        }
+    }
     Ok(())
 }
 
@@ -832,7 +1056,7 @@ fn run_resume_command(
                 message: Some(format_cost_report(usage)),
             })
         }
-        SlashCommand::Config { section } => Ok(ResumeCommandOutcome {
+        SlashCommand::Config { section, .. } => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_config_report(section.as_deref())?),
         }),
@@ -868,6 +1092,8 @@ fn run_resume_command(
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
+        | SlashCommand::Commit
+        | SlashCommand::Pr
         | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
     }
 }
@@ -876,8 +1102,9 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    provider: Provider,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode, provider)?;
     let mut editor = input::LineEditor::new("> ", slash_command_completion_candidates());
     println!("{}", cli.startup_banner());
 
@@ -899,7 +1126,10 @@ fn run_repl(
                     continue;
                 }
                 editor.push_history(input);
-                cli.run_turn(&trimmed)?;
+                let expanded = expand_file_references(&trimmed);
+                cli.run_turn(&expanded)?;
+                // Auto-compact if conversation is getting long
+                let _ = cli.try_auto_compact();
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -909,6 +1139,7 @@ fn run_repl(
         }
     }
 
+    cli.hooks.run_stop();
     Ok(())
 }
 
@@ -930,9 +1161,13 @@ struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    provider: Provider,
     system_prompt: Vec<String>,
-    runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+    runtime: ConversationRuntime<ProviderClient, CliToolExecutor>,
     session: SessionHandle,
+    hooks: runtime::HookRunner,
+    mcp_tools: Vec<McpToolSpec>,
+    mcp_manager: Option<Arc<Mutex<McpServerManager>>>,
 }
 
 impl LiveCli {
@@ -941,9 +1176,19 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        provider: Provider,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session = create_managed_session_handle()?;
+        let cwd = env::current_dir().unwrap_or_default();
+        let config = ConfigLoader::default_for(&cwd)
+            .load()
+            .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
+        let hooks = runtime::HookRunner::from_config_value(config.get("hooks"));
+
+        // Initialize MCP servers from config
+        let (mcp_tools, mcp_manager) = initialize_mcp_servers(&config);
+
         let runtime = build_runtime(
             Session::new(),
             model.clone(),
@@ -951,14 +1196,22 @@ impl LiveCli {
             enable_tools,
             allowed_tools.clone(),
             permission_mode,
+            provider,
+            hooks.clone(),
+            mcp_tools.clone(),
+            mcp_manager.clone(),
         )?;
         let cli = Self {
             model,
             allowed_tools,
             permission_mode,
+            provider,
             system_prompt,
             runtime,
             session,
+            hooks,
+            mcp_tools,
+            mcp_manager,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -969,6 +1222,18 @@ impl LiveCli {
             |_| "<unknown>".to_string(),
             |path| path.display().to_string(),
         );
+        let provider_label = match self.provider {
+            Provider::Anthropic => "Anthropic",
+            Provider::OpenAi => "OpenAI Codex",
+        };
+        let mcp_line = if self.mcp_tools.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n  \x1b[2mMCP tools\x1b[0m        {} tool(s)",
+                self.mcp_tools.len()
+            )
+        };
         format!(
             "\x1b[38;5;196m\
  ██████╗██╗      █████╗ ██╗    ██╗\n\
@@ -978,14 +1243,17 @@ impl LiveCli {
 ╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
   \x1b[2mModel\x1b[0m            {}\n\
+  \x1b[2mProvider\x1b[0m         {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\n\
+  \x1b[2mSession\x1b[0m          {}{}\n\n\
   Type \x1b[1m/help\x1b[0m for commands · \x1b[2mShift+Enter\x1b[0m for newline",
             self.model,
+            provider_label,
             self.permission_mode.as_str(),
             cwd,
             self.session.id,
+            mcp_line,
         )
     }
 
@@ -1006,6 +1274,7 @@ impl LiveCli {
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                write!(stdout, "\x07")?; // terminal bell
                 println!();
                 self.persist_session()?;
                 Ok(())
@@ -1016,6 +1285,7 @@ impl LiveCli {
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                write!(stdout, "\x07")?; // terminal bell
                 Err(Box::new(error))
             }
         }
@@ -1100,8 +1370,18 @@ impl LiveCli {
                 false
             }
             SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
-            SlashCommand::Config { section } => {
-                Self::print_config(section.as_deref())?;
+            SlashCommand::Config { section, set_key, set_value } => {
+                if let (Some(key), Some(value)) = (set_key, set_value) {
+                    match execute_tool("Config", &serde_json::json!({
+                        "setting": key,
+                        "value": value,
+                    })) {
+                        Ok(output) => println!("{output}"),
+                        Err(error) => eprintln!("config set failed: {error}"),
+                    }
+                } else {
+                    Self::print_config(section.as_deref())?;
+                }
                 false
             }
             SlashCommand::Memory => {
@@ -1126,6 +1406,14 @@ impl LiveCli {
             }
             SlashCommand::Session { action, target } => {
                 self.handle_session_command(action.as_deref(), target.as_deref())?
+            }
+            SlashCommand::Commit => {
+                self.run_turn("Review the current git diff and create an appropriate git commit. Use `git add` for relevant files and `git commit` with a good commit message following conventional commits format.")?;
+                true
+            }
+            SlashCommand::Pr => {
+                self.run_turn("Create a pull request for the current branch. Use `gh pr create` with an appropriate title and description based on the commits. If not on a feature branch, suggest creating one first.")?;
+                true
             }
             SlashCommand::Unknown(name) => {
                 eprintln!("unknown slash command: /{name}");
@@ -1194,6 +1482,10 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.provider,
+            self.hooks.clone(),
+            self.mcp_tools.clone(),
+            self.mcp_manager.clone(),
         )?;
         self.model.clone_from(&model);
         println!(
@@ -1236,6 +1528,10 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.provider,
+            self.hooks.clone(),
+            self.mcp_tools.clone(),
+            self.mcp_manager.clone(),
         )?;
         println!(
             "{}",
@@ -1260,6 +1556,10 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.provider,
+            self.hooks.clone(),
+            self.mcp_tools.clone(),
+            self.mcp_manager.clone(),
         )?;
         println!(
             "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
@@ -1273,6 +1573,40 @@ impl LiveCli {
     fn print_cost(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
         println!("{}", format_cost_report(cumulative));
+    }
+
+    fn try_auto_compact(&mut self) -> Option<()> {
+        let config = CompactionConfig::default();
+        if !should_compact(self.runtime.session(), config) {
+            return None;
+        }
+        let result = compact_session(self.runtime.session(), config);
+        if result.removed_message_count == 0 {
+            return None;
+        }
+        println!(
+            "\n\x1b[2m[Auto-compact: removed {} messages, ~{} tokens saved]\x1b[0m",
+            result.removed_message_count,
+            result.removed_message_count * 200
+        );
+        match build_runtime(
+            result.compacted_session,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            self.provider,
+            self.hooks.clone(),
+            self.mcp_tools.clone(),
+            self.mcp_manager.clone(),
+        ) {
+            Ok(new_runtime) => {
+                self.runtime = new_runtime;
+                Some(())
+            }
+            Err(_) => None,
+        }
     }
 
     fn resume_session(
@@ -1294,6 +1628,10 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.provider,
+            self.hooks.clone(),
+            self.mcp_tools.clone(),
+            self.mcp_manager.clone(),
         )?;
         self.session = handle;
         println!(
@@ -1365,6 +1703,10 @@ impl LiveCli {
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
+                    self.provider,
+                    self.hooks.clone(),
+                    self.mcp_tools.clone(),
+                    self.mcp_manager.clone(),
                 )?;
                 self.session = handle;
                 println!(
@@ -1394,6 +1736,10 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.provider,
+            self.hooks.clone(),
+            self.mcp_tools.clone(),
+            self.mcp_manager.clone(),
         )?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
@@ -1854,6 +2200,76 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     )?)
 }
 
+fn initialize_mcp_servers(
+    config: &runtime::RuntimeConfig,
+) -> (Vec<McpToolSpec>, Option<Arc<Mutex<McpServerManager>>>) {
+    let mcp_config = config.mcp();
+    if mcp_config.servers().is_empty() {
+        return (Vec::new(), None);
+    }
+
+    let mut manager = McpServerManager::from_runtime_config(config);
+
+    // Log unsupported servers
+    for unsupported in manager.unsupported_servers() {
+        eprintln!(
+            "  \x1b[33mMCP server `{}` skipped: {}\x1b[0m",
+            unsupported.server_name, unsupported.reason
+        );
+    }
+
+    // Discover tools from supported servers using a temporary tokio runtime
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(error) => {
+            eprintln!("  \x1b[33mMCP: failed to create async runtime: {error}\x1b[0m");
+            return (Vec::new(), None);
+        }
+    };
+
+    let discovered = match rt.block_on(manager.discover_tools()) {
+        Ok(tools) => tools,
+        Err(error) => {
+            eprintln!("  \x1b[33mMCP: failed to discover tools: {error}\x1b[0m");
+            // Return the manager even on partial failure so it can retry later
+            let arc = Arc::new(Mutex::new(manager));
+            return (Vec::new(), Some(arc));
+        }
+    };
+
+    let mcp_tools: Vec<McpToolSpec> = discovered
+        .iter()
+        .map(|t| McpToolSpec {
+            name: t.qualified_name.clone(),
+            description: t
+                .tool
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("MCP tool {} from server {}", t.raw_name, t.server_name)),
+            input_schema: t
+                .tool
+                .input_schema
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+        })
+        .collect();
+
+    if !mcp_tools.is_empty() {
+        eprintln!(
+            "  \x1b[2mMCP tools\x1b[0m         {} tool(s) from {} server(s)",
+            mcp_tools.len(),
+            mcp_config
+                .servers()
+                .keys()
+                .filter(|name| discovered.iter().any(|t| &t.server_name == *name))
+                .count()
+        );
+    }
+
+    let arc = Arc::new(Mutex::new(manager));
+    (mcp_tools, Some(arc))
+}
+
 fn build_runtime(
     session: Session,
     model: String,
@@ -1861,12 +2277,31 @@ fn build_runtime(
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
-{
+    provider: Provider,
+    hooks: runtime::HookRunner,
+    mcp_tools: Vec<McpToolSpec>,
+    mcp_manager: Option<Arc<Mutex<McpServerManager>>>,
+) -> Result<ConversationRuntime<ProviderClient, CliToolExecutor>, Box<dyn std::error::Error>> {
+    let model_for_executor = model.clone();
+    let mcp_tools_for_executor = mcp_tools.clone();
+    let client = match provider {
+        Provider::Anthropic => ProviderClient::Anthropic(AnthropicRuntimeClient::new(
+            model,
+            enable_tools,
+            allowed_tools.clone(),
+            mcp_tools.clone(),
+        )?),
+        Provider::OpenAi => ProviderClient::OpenAi(OpenAiRuntimeClient::new(
+            model,
+            enable_tools,
+            allowed_tools.clone(),
+            mcp_tools,
+        )?),
+    };
     Ok(ConversationRuntime::new(
         session,
-        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone())?,
-        CliToolExecutor::new(allowed_tools),
+        client,
+        CliToolExecutor::new(allowed_tools, hooks, mcp_manager, mcp_tools_for_executor, provider, model_for_executor, permission_mode),
         permission_policy(permission_mode),
         system_prompt,
     ))
@@ -1924,6 +2359,7 @@ struct AnthropicRuntimeClient {
     model: String,
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
+    mcp_tools: Vec<McpToolSpec>,
 }
 
 impl AnthropicRuntimeClient {
@@ -1931,6 +2367,7 @@ impl AnthropicRuntimeClient {
         model: String,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
+        mcp_tools: Vec<McpToolSpec>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -1938,6 +2375,7 @@ impl AnthropicRuntimeClient {
             model,
             enable_tools,
             allowed_tools,
+            mcp_tools,
         })
     }
 }
@@ -1961,14 +2399,22 @@ impl ApiClient for AnthropicRuntimeClient {
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self.enable_tools.then(|| {
-                filter_tool_specs(self.allowed_tools.as_ref())
+                let mut tools: Vec<ToolDefinition> = filter_tool_specs(self.allowed_tools.as_ref())
                     .into_iter()
                     .map(|spec| ToolDefinition {
                         name: spec.name.to_string(),
                         description: Some(spec.description.to_string()),
                         input_schema: spec.input_schema,
                     })
-                    .collect()
+                    .collect();
+                for mcp in filter_mcp_tools(&self.mcp_tools, self.allowed_tools.as_ref()) {
+                    tools.push(ToolDefinition {
+                        name: mcp.name,
+                        description: Some(mcp.description),
+                        input_schema: mcp.input_schema,
+                    });
+                }
+                tools
             }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
@@ -2065,6 +2511,214 @@ impl ApiClient for AnthropicRuntimeClient {
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             response_to_events(response, &mut stdout)
         })
+    }
+}
+
+struct OpenAiRuntimeClient {
+    runtime: tokio::runtime::Runtime,
+    client: OpenAiClient,
+    model: String,
+    enable_tools: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    mcp_tools: Vec<McpToolSpec>,
+}
+
+impl OpenAiRuntimeClient {
+    fn new(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        mcp_tools: Vec<McpToolSpec>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let creds = resolve_openai_auth()?;
+        Ok(Self {
+            runtime: tokio::runtime::Runtime::new()?,
+            client: OpenAiClient::new(&creds.access_token)
+                .with_base_url(read_openai_base_url())
+                .with_account_id(creds.account_id),
+            model,
+            enable_tools,
+            allowed_tools,
+            mcp_tools,
+        })
+    }
+}
+
+impl ApiClient for OpenAiRuntimeClient {
+    #[allow(clippy::too_many_lines)]
+    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let tools: Option<Vec<ResponsesTool>> = self.enable_tools.then(|| {
+            let mut tools: Vec<ResponsesTool> = filter_tool_specs(self.allowed_tools.as_ref())
+                .into_iter()
+                .filter(|spec| {
+                    // ChatGPT backend requires "properties" in object schemas
+                    spec.input_schema
+                        .get("properties")
+                        .is_some_and(|p| p.is_object())
+                })
+                .map(|spec| ResponsesTool {
+                    kind: "function".to_string(),
+                    name: spec.name.to_string(),
+                    description: Some(spec.description.to_string()),
+                    parameters: Some(spec.input_schema),
+                })
+                .collect();
+            for mcp in filter_mcp_tools(&self.mcp_tools, self.allowed_tools.as_ref()) {
+                if mcp.input_schema.get("properties").is_some_and(|p| p.is_object()) {
+                    tools.push(ResponsesTool {
+                        kind: "function".to_string(),
+                        name: mcp.name,
+                        description: Some(mcp.description),
+                        parameters: Some(mcp.input_schema),
+                    });
+                }
+            }
+            tools
+        });
+
+        let instructions = if request.system_prompt.is_empty() {
+            Some("You are a helpful coding assistant.".to_string())
+        } else {
+            Some(request.system_prompt.join("\n\n"))
+        };
+
+        let responses_request = ResponsesRequest {
+            model: self.model.clone(),
+            input: convert_to_responses_input(&request.messages),
+            max_output_tokens: None,
+            tools,
+            tool_choice: self.enable_tools.then(|| "auto".to_string()),
+            instructions,
+            stream: true,
+            store: Some(false),
+            include: Some(vec!["reasoning.encrypted_content".to_string()]),
+        };
+
+        self.runtime.block_on(async {
+            let mut stream = self
+                .client
+                .stream_responses(&responses_request)
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let mut stdout = io::stdout();
+            let mut events = Vec::new();
+            let mut saw_stop = false;
+
+            // Track in-progress function calls by their item ID
+            let mut pending_fn_calls: BTreeMap<String, (String, String, String)> = BTreeMap::new();
+            // call_id, name, arguments
+
+            while let Some((event_type, data)) = stream
+                .next_event()
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?
+            {
+                match event_type.as_str() {
+                    "response.output_text.delta" => {
+                        if let Some(delta) = data.get("delta").and_then(|d| d.as_str()) {
+                            if !delta.is_empty() {
+                                write!(stdout, "{delta}")
+                                    .and_then(|()| stdout.flush())
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                events.push(AssistantEvent::TextDelta(delta.to_string()));
+                            }
+                        }
+                    }
+                    "response.function_call_arguments.delta" => {
+                        // Accumulate function call arguments
+                        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let delta = data.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                        let entry = pending_fn_calls
+                            .entry(item_id)
+                            .or_insert_with(|| (String::new(), String::new(), String::new()));
+                        entry.2.push_str(delta);
+                    }
+                    "response.output_item.added" => {
+                        // A new output item is being streamed
+                        if let Some(item) = data.get("item") {
+                            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if item_type == "function_call" {
+                                let item_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                pending_fn_calls.insert(item_id, (call_id, name, String::new()));
+                            }
+                        }
+                    }
+                    "response.function_call_arguments.done" => {
+                        let item_id = data.get("item_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if let Some((call_id, name, arguments)) = pending_fn_calls.remove(&item_id) {
+                            writeln!(
+                                stdout,
+                                "\n{}",
+                                format_tool_call_start(&name, &arguments)
+                            )
+                            .and_then(|()| stdout.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            // Encode both IDs: fc_ item ID and call_ ID
+                            // so convert_to_responses_input can reconstruct both
+                            let combined_id = format!("{item_id}:{call_id}");
+                            events.push(AssistantEvent::ToolUse {
+                                id: combined_id,
+                                name,
+                                input: arguments,
+                            });
+                        }
+                    }
+                    "response.completed" => {
+                        // Extract usage from the completed response
+                        if let Some(response) = data.get("response") {
+                            if let Some(usage) = response.get("usage") {
+                                let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                events.push(AssistantEvent::Usage(TokenUsage {
+                                    input_tokens,
+                                    output_tokens,
+                                    cache_creation_input_tokens: 0,
+                                    cache_read_input_tokens: 0,
+                                }));
+                            }
+                        }
+                        saw_stop = true;
+                        events.push(AssistantEvent::MessageStop);
+                    }
+                    _ => {
+                        // Ignore other event types (response.created, response.output_item.done, etc.)
+                    }
+                }
+            }
+
+            if !saw_stop && !events.is_empty() {
+                // Flush remaining pending function calls
+                for (item_id, (call_id, name, arguments)) in std::mem::take(&mut pending_fn_calls) {
+                    if !name.is_empty() {
+                        let combined_id = format!("{item_id}:{call_id}");
+                        events.push(AssistantEvent::ToolUse {
+                            id: combined_id,
+                            name,
+                            input: arguments,
+                        });
+                    }
+                }
+                events.push(AssistantEvent::MessageStop);
+            }
+
+            Ok(events)
+        })
+    }
+}
+
+enum ProviderClient {
+    Anthropic(AnthropicRuntimeClient),
+    OpenAi(OpenAiRuntimeClient),
+}
+
+impl ApiClient for ProviderClient {
+    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        match self {
+            Self::Anthropic(client) => client.stream(request),
+            Self::OpenAi(client) => client.stream(request),
+        }
     }
 }
 
@@ -2182,15 +2836,162 @@ fn response_to_events(
 struct CliToolExecutor {
     renderer: TerminalRenderer,
     allowed_tools: Option<AllowedToolSet>,
+    hooks: runtime::HookRunner,
+    mcp_manager: Option<Arc<Mutex<McpServerManager>>>,
+    mcp_tools: Vec<McpToolSpec>,
+    provider: Provider,
+    model: String,
+    permission_mode: PermissionMode,
 }
 
 impl CliToolExecutor {
-    fn new(allowed_tools: Option<AllowedToolSet>) -> Self {
+    fn new(
+        allowed_tools: Option<AllowedToolSet>,
+        hooks: runtime::HookRunner,
+        mcp_manager: Option<Arc<Mutex<McpServerManager>>>,
+        mcp_tools: Vec<McpToolSpec>,
+        provider: Provider,
+        model: String,
+        permission_mode: PermissionMode,
+    ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
             allowed_tools,
+            hooks,
+            mcp_manager,
+            mcp_tools,
+            provider,
+            model,
+            permission_mode,
         }
     }
+
+    fn execute_mcp_tool(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        let manager = self
+            .mcp_manager
+            .as_ref()
+            .ok_or_else(|| ToolError::new(format!("MCP tool `{tool_name}` called but no MCP manager is available")))?;
+
+        let arguments: Option<serde_json::Value> = if input.trim().is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::new(format!("invalid MCP tool input JSON: {error}")))?,
+            )
+        };
+
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|error| ToolError::new(format!("failed to create tokio runtime: {error}")))?;
+
+        let response = rt.block_on(async {
+            let mut mgr = manager.lock().map_err(|error| {
+                ToolError::new(format!("failed to lock MCP manager: {error}"))
+            })?;
+            mgr.call_tool(tool_name, arguments)
+                .await
+                .map_err(|error| ToolError::new(format!("MCP tool call failed: {error}")))
+        })?;
+
+        if let Some(error) = response.error {
+            return Err(ToolError::new(format!(
+                "MCP JSON-RPC error: {} ({})",
+                error.message, error.code
+            )));
+        }
+
+        match response.result {
+            Some(result) => {
+                let is_error = result.is_error.unwrap_or(false);
+                let text = result
+                    .content
+                    .iter()
+                    .filter_map(|c| c.data.get("text").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if is_error {
+                    Err(ToolError::new(text))
+                } else {
+                    Ok(text)
+                }
+            }
+            None => Ok(String::new()),
+        }
+    }
+
+    fn execute_agent_subconversation(&self, input: &serde_json::Value) -> Result<String, ToolError> {
+        let description = input.get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("sub-agent task");
+        let prompt = input.get("prompt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::new("Agent tool requires a 'prompt' field"))?;
+        let agent_model = input.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&self.model);
+
+        eprintln!("\n\x1b[2m[Sub-agent: {description}]\x1b[0m");
+
+        // Build a child runtime with the prompt as system prompt
+        // Exclude "Agent" from child tools to prevent infinite recursion
+        let child_allowed = child_allowed_tools(self.allowed_tools.as_ref());
+
+        let child_hooks = self.hooks.clone();
+        let mut child_runtime = build_runtime(
+            Session::new(),
+            agent_model.to_string(),
+            vec![prompt.to_string()],
+            true,
+            child_allowed,
+            self.permission_mode,
+            self.provider,
+            child_hooks,
+            self.mcp_tools.clone(),
+            self.mcp_manager.clone(),
+        ).map_err(|e| ToolError::new(format!("failed to create sub-agent runtime: {e}")))?;
+
+        // Run the child conversation
+        let turn_input = "Execute the task described in your instructions. When done, summarize what you accomplished.";
+
+        match child_runtime.run_turn(turn_input, None) {
+            Ok(summary) => {
+                // Extract the last assistant text from the child session
+                let session = child_runtime.session();
+                let result_text = session.messages.iter()
+                    .rev()
+                    .find(|m| m.role == MessageRole::Assistant)
+                    .map(|m| {
+                        m.blocks.iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_else(|| "Sub-agent completed but produced no text output.".to_string());
+
+                eprintln!("\x1b[2m[Sub-agent completed: {} iterations]\x1b[0m", summary.iterations);
+                Ok(serde_json::json!({
+                    "status": "completed",
+                    "description": description,
+                    "result": result_text,
+                    "iterations": summary.iterations,
+                }).to_string())
+            }
+            Err(error) => {
+                Ok(serde_json::json!({
+                    "status": "failed",
+                    "description": description,
+                    "error": error.to_string(),
+                }).to_string())
+            }
+        }
+    }
+}
+
+fn is_mcp_tool(tool_name: &str) -> bool {
+    tool_name.starts_with("mcp__")
 }
 
 impl ToolExecutor for CliToolExecutor {
@@ -2204,10 +3005,111 @@ impl ToolExecutor for CliToolExecutor {
                 "tool `{tool_name}` is not enabled by the current --allowedTools setting"
             )));
         }
-        let value = serde_json::from_str(input)
+        if let runtime::HookOutcome::Block { reason } =
+            self.hooks.run_pre_tool_use(tool_name, input)
+        {
+            return Err(ToolError::new(format!(
+                "blocked by PreToolUse hook: {reason}"
+            )));
+        }
+
+        // Route MCP tools to the MCP manager
+        if is_mcp_tool(tool_name) {
+            return match self.execute_mcp_tool(tool_name, input) {
+                Ok(output) => {
+                    let _ = self.hooks.run_post_tool_use(tool_name, &output);
+                    let markdown = format_tool_result(tool_name, &output, false);
+                    self.renderer
+                        .stream_markdown(&markdown, &mut io::stdout())
+                        .map_err(|error| ToolError::new(error.to_string()))?;
+                    Ok(output)
+                }
+                Err(error) => {
+                    let error_str = error.to_string();
+                    let _ = self.hooks.run_post_tool_use(tool_name, &error_str);
+                    let markdown = format_tool_result(tool_name, &error_str, true);
+                    self.renderer
+                        .stream_markdown(&markdown, &mut io::stdout())
+                        .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
+                    Err(error)
+                }
+            };
+        }
+
+        let value: serde_json::Value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+
+        // Intercept Agent tool — run a real sub-conversation
+        if tool_name == "Agent" {
+            let result = self.execute_agent_subconversation(&value);
+            match &result {
+                Ok(output) => {
+                    let _ = self.hooks.run_post_tool_use(tool_name, output);
+                    let markdown = format_tool_result(tool_name, output, false);
+                    self.renderer
+                        .stream_markdown(&markdown, &mut io::stdout())
+                        .map_err(|error| ToolError::new(error.to_string()))?;
+                }
+                Err(error) => {
+                    let error_str = error.to_string();
+                    let _ = self.hooks.run_post_tool_use(tool_name, &error_str);
+                    let markdown = format_tool_result(tool_name, &error_str, true);
+                    self.renderer
+                        .stream_markdown(&markdown, &mut io::stdout())
+                        .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
+                }
+            }
+            return result;
+        }
+
+        // Intercept Skill tool — load skill prompt then run as sub-conversation
+        if tool_name == "Skill" {
+            let skill_output = execute_tool("Skill", &value)
+                .map_err(|e| ToolError::new(e))?;
+
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&skill_output) {
+                if let Some(prompt) = parsed.get("prompt").and_then(|v| v.as_str()) {
+                    let skill_name = parsed.get("skill")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let agent_input = serde_json::json!({
+                        "description": format!("Skill: {}", skill_name),
+                        "prompt": prompt,
+                    });
+                    let result = self.execute_agent_subconversation(&agent_input);
+                    match &result {
+                        Ok(output) => {
+                            let _ = self.hooks.run_post_tool_use(tool_name, output);
+                            let markdown = format_tool_result(tool_name, output, false);
+                            self.renderer
+                                .stream_markdown(&markdown, &mut io::stdout())
+                                .map_err(|error| ToolError::new(error.to_string()))?;
+                        }
+                        Err(error) => {
+                            let error_str = error.to_string();
+                            let _ = self.hooks.run_post_tool_use(tool_name, &error_str);
+                            let markdown = format_tool_result(tool_name, &error_str, true);
+                            self.renderer
+                                .stream_markdown(&markdown, &mut io::stdout())
+                                .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
+                        }
+                    }
+                    return result;
+                }
+            }
+
+            // No prompt in the skill output — return the raw output
+            let _ = self.hooks.run_post_tool_use(tool_name, &skill_output);
+            let markdown = format_tool_result(tool_name, &skill_output, false);
+            self.renderer
+                .stream_markdown(&markdown, &mut io::stdout())
+                .map_err(|error| ToolError::new(error.to_string()))?;
+            return Ok(skill_output);
+        }
+
         match execute_tool(tool_name, &value) {
             Ok(output) => {
+                let _ = self.hooks.run_post_tool_use(tool_name, &output);
                 let markdown = format_tool_result(tool_name, &output, false);
                 self.renderer
                     .stream_markdown(&markdown, &mut io::stdout())
@@ -2215,6 +3117,7 @@ impl ToolExecutor for CliToolExecutor {
                 Ok(output)
             }
             Err(error) => {
+                let _ = self.hooks.run_post_tool_use(tool_name, &error);
                 let markdown = format_tool_result(tool_name, &error, true);
                 self.renderer
                     .stream_markdown(&markdown, &mut io::stdout())
@@ -2278,6 +3181,131 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
         .collect()
 }
 
+fn convert_to_responses_input(
+    messages: &[ConversationMessage],
+) -> Vec<ResponsesInput> {
+    let mut result = Vec::new();
+
+    for message in messages {
+        match message.role {
+            MessageRole::System | MessageRole::User => {
+                let text: String = message
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    result.push(ResponsesInput::Message(ResponsesMessage {
+                        role: "user".to_string(),
+                        content: ResponsesContent::Text(text),
+                    }));
+                }
+            }
+            MessageRole::Assistant => {
+                // For assistant messages, we need to output both text and function calls
+                for block in &message.blocks {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            if !text.is_empty() {
+                                result.push(ResponsesInput::Message(ResponsesMessage {
+                                    role: "assistant".to_string(),
+                                    content: ResponsesContent::Text(text.clone()),
+                                }));
+                            }
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            // id may be "fc_xxx:call_xxx" (combined) or plain
+                            let (item_id, call_id) = id
+                                .split_once(':')
+                                .unwrap_or((id, id));
+                            result.push(ResponsesInput::FunctionCall(ResponsesFunctionCallInput {
+                                kind: "function_call".to_string(),
+                                id: item_id.to_string(),
+                                call_id: call_id.to_string(),
+                                name: name.clone(),
+                                arguments: input.clone(),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            MessageRole::Tool => {
+                // Tool results become function_call_output items
+                for block in &message.blocks {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        output,
+                        ..
+                    } = block
+                    {
+                        // tool_use_id may be "fc_xxx:call_xxx" — extract call_id part
+                        let call_id = tool_use_id
+                            .split_once(':')
+                            .map(|(_, c)| c)
+                            .unwrap_or(tool_use_id);
+                        result.push(ResponsesInput::FunctionCallOutput(ResponsesFunctionCallOutputInput {
+                            kind: "function_call_output".to_string(),
+                            call_id: call_id.to_string(),
+                            output: output.clone(),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Expand `@path` references in user input to include file contents inline.
+/// e.g. "explain @src/main.rs" becomes "explain \n<file path=\"src/main.rs\">\n...contents...\n</file>"
+fn expand_file_references(input: &str) -> String {
+    let mut result = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '@' {
+            // Collect the file path (non-whitespace characters after @)
+            let mut path_str = String::new();
+            while let Some(&next) = chars.peek() {
+                if next.is_whitespace() {
+                    break;
+                }
+                path_str.push(chars.next().unwrap());
+            }
+            if path_str.is_empty() {
+                result.push('@');
+                continue;
+            }
+            let path = Path::new(&path_str);
+            if path.exists() && path.is_file() {
+                match fs::read_to_string(path) {
+                    Ok(contents) => {
+                        result.push_str(&format!(
+                            "\n<file path=\"{path_str}\">\n{contents}\n</file>\n"
+                        ));
+                    }
+                    Err(_) => {
+                        // Could not read — keep the original @reference
+                        result.push('@');
+                        result.push_str(&path_str);
+                    }
+                }
+            } else {
+                // Not a valid file — keep the original text
+                result.push('@');
+                result.push_str(&path_str);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "claw v{VERSION}")?;
     writeln!(out)?;
@@ -2331,6 +3359,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(
         out,
+        "  --provider PROVIDER        Select provider: anthropic, claude, openai, codex"
+    )?;
+    writeln!(
+        out,
         "  --version, -V              Print version and build information locally"
     )?;
     writeln!(out)?;
@@ -2375,13 +3407,14 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_tool_specs, format_compact_report, format_cost_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
+        child_allowed_tools, filter_mcp_tools, filter_tool_specs, format_compact_report,
+        format_cost_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result,
         normalize_permission_mode, parse_args, parse_git_status_metadata, print_help_to,
         render_config_report, render_memory_report, render_repl_help,
-        resume_supported_slash_commands, status_context, CliAction, CliOutputFormat, SlashCommand,
-        StatusUsage, DEFAULT_MODEL,
+        resume_supported_slash_commands, status_context, CliAction, CliOutputFormat, Provider,
+        SlashCommand, StatusUsage, DEFAULT_MODEL, McpToolSpec,
     };
     use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
     use std::path::PathBuf;
@@ -2394,6 +3427,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
+                provider: Provider::Anthropic,
             }
         );
     }
@@ -2413,6 +3447,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
+                provider: Provider::Anthropic,
             }
         );
     }
@@ -2434,6 +3469,7 @@ mod tests {
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
+                provider: Provider::Anthropic,
             }
         );
     }
@@ -2459,6 +3495,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
+                provider: Provider::Anthropic,
             }
         );
     }
@@ -2481,6 +3518,29 @@ mod tests {
                         .collect()
                 ),
                 permission_mode: PermissionMode::WorkspaceWrite,
+                provider: Provider::Anthropic,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_allowed_mcp_tools_by_exact_name() {
+        let args = vec![
+            "--allowedTools".to_string(),
+            "read,mcp__demo__echo".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: Some(
+                    ["mcp__demo__echo", "read_file"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                ),
+                permission_mode: PermissionMode::WorkspaceWrite,
+                provider: Provider::Anthropic,
             }
         );
     }
@@ -2514,11 +3574,11 @@ mod tests {
     fn parses_login_and_logout_subcommands() {
         assert_eq!(
             parse_args(&["login".to_string()]).expect("login should parse"),
-            CliAction::Login
+            CliAction::Login { provider: Provider::Anthropic }
         );
         assert_eq!(
             parse_args(&["logout".to_string()]).expect("logout should parse"),
-            CliAction::Logout
+            CliAction::Logout { provider: Provider::Anthropic }
         );
         assert_eq!(
             parse_args(&["init".to_string()]).expect("init should parse"),
@@ -2576,6 +3636,44 @@ mod tests {
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["read_file", "grep_search"]);
+    }
+
+    #[test]
+    fn filtered_mcp_tools_respect_allowlist() {
+        let allowed = ["mcp__demo__echo"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let filtered = filter_mcp_tools(
+            &[
+                McpToolSpec {
+                    name: "mcp__demo__echo".to_string(),
+                    description: "Echo".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                McpToolSpec {
+                    name: "mcp__demo__sum".to_string(),
+                    description: "Sum".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ],
+            Some(&allowed),
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "mcp__demo__echo");
+    }
+
+    #[test]
+    fn child_allowed_tools_preserve_parent_restrictions() {
+        let allowed = ["read_file", "Agent", "Skill", "mcp__demo__echo"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let child = child_allowed_tools(Some(&allowed)).expect("child allowlist");
+        assert!(child.contains("read_file"));
+        assert!(child.contains("mcp__demo__echo"));
+        assert!(!child.contains("Agent"));
+        assert!(!child.contains("Skill"));
     }
 
     #[test]
@@ -2830,12 +3928,22 @@ mod tests {
         );
         assert_eq!(
             SlashCommand::parse("/config"),
-            Some(SlashCommand::Config { section: None })
+            Some(SlashCommand::Config { section: None, set_key: None, set_value: None })
         );
         assert_eq!(
             SlashCommand::parse("/config env"),
             Some(SlashCommand::Config {
-                section: Some("env".to_string())
+                section: Some("env".to_string()),
+                set_key: None,
+                set_value: None,
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/config set model claude-opus-4-6"),
+            Some(SlashCommand::Config {
+                section: None,
+                set_key: Some("model".to_string()),
+                set_value: Some("claude-opus-4-6".to_string()),
             })
         );
         assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));

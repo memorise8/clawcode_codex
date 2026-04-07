@@ -85,6 +85,47 @@ impl InputBuffer {
         self.cursor = 0;
     }
 
+    pub fn move_word_forward(&mut self) {
+        while self.cursor < self.buffer.len() {
+            let ch = self.buffer[self.cursor..].chars().next().unwrap();
+            if ch.is_whitespace() {
+                break;
+            }
+            self.cursor += ch.len_utf8();
+        }
+        while self.cursor < self.buffer.len() {
+            let ch = self.buffer[self.cursor..].chars().next().unwrap();
+            if !ch.is_whitespace() {
+                break;
+            }
+            self.cursor += ch.len_utf8();
+        }
+    }
+
+    pub fn move_word_backward(&mut self) {
+        while self.cursor > 0 {
+            let prev = self.buffer[..self.cursor].chars().last().unwrap();
+            if !prev.is_whitespace() {
+                break;
+            }
+            self.cursor -= prev.len_utf8();
+        }
+        while self.cursor > 0 {
+            let prev = self.buffer[..self.cursor].chars().last().unwrap();
+            if prev.is_whitespace() {
+                break;
+            }
+            self.cursor -= prev.len_utf8();
+        }
+    }
+
+    pub fn delete_char_at_cursor(&mut self) {
+        if self.cursor < self.buffer.len() {
+            let ch = self.buffer[self.cursor..].chars().next().unwrap();
+            self.buffer.drain(self.cursor..self.cursor + ch.len_utf8());
+        }
+    }
+
     pub fn replace(&mut self, value: impl Into<String>) {
         self.buffer = value.into();
         self.cursor = self.buffer.len();
@@ -100,6 +141,45 @@ impl InputBuffer {
             return None;
         }
         Some(prefix)
+    }
+
+    pub fn complete_file_reference(&mut self) -> bool {
+        let before = &self.buffer[..self.cursor];
+        let at_pos = match before.rfind('@') {
+            Some(pos) => pos,
+            None => return false,
+        };
+        if at_pos > 0 && !before.as_bytes()[at_pos - 1].is_ascii_whitespace() {
+            return false;
+        }
+        let partial = &before[at_pos + 1..];
+        if partial.is_empty() {
+            return false;
+        }
+
+        let pattern = format!("{partial}*");
+        let matches = glob_files(&pattern);
+        if matches.is_empty() {
+            return false;
+        }
+
+        if matches.len() == 1 {
+            let completed = &matches[0];
+            let new_before = format!("{}@{}", &before[..at_pos], completed);
+            let after = self.buffer[self.cursor..].to_string();
+            self.buffer = format!("{new_before}{after}");
+            self.cursor = new_before.len();
+        } else {
+            let match_refs: Vec<&str> = matches.iter().map(String::as_str).collect();
+            let lcp = longest_common_prefix(&match_refs);
+            if lcp.len() > partial.len() {
+                let new_before = format!("{}@{}", &before[..at_pos], lcp);
+                let after = self.buffer[self.cursor..].to_string();
+                self.buffer = format!("{new_before}{after}");
+                self.cursor = new_before.len();
+            }
+        }
+        true
     }
 
     pub fn complete_slash_command(&mut self, candidates: &[String]) -> bool {
@@ -162,6 +242,12 @@ impl RenderedBuffer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VimMode {
+    Insert,
+    Normal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
     Submit(String),
@@ -176,6 +262,8 @@ pub struct LineEditor {
     history_index: Option<usize>,
     draft: Option<String>,
     completions: Vec<String>,
+    vim_mode: VimMode,
+    pending_key: Option<char>,
 }
 
 impl LineEditor {
@@ -188,6 +276,8 @@ impl LineEditor {
             history_index: None,
             draft: None,
             completions,
+            vim_mode: VimMode::Insert,
+            pending_key: None,
         }
     }
 
@@ -224,6 +314,8 @@ impl LineEditor {
                         writeln!(stdout)?;
                         self.history_index = None;
                         self.draft = None;
+                        self.vim_mode = VimMode::Insert;
+                        self.pending_key = None;
                         return Ok(ReadOutcome::Submit(input.as_str().to_owned()));
                     }
                     EditorAction::Cancel => {
@@ -231,6 +323,8 @@ impl LineEditor {
                         writeln!(stdout)?;
                         self.history_index = None;
                         self.draft = None;
+                        self.vim_mode = VimMode::Insert;
+                        self.pending_key = None;
                         return Ok(ReadOutcome::Cancel);
                     }
                     EditorAction::Exit => {
@@ -238,6 +332,8 @@ impl LineEditor {
                         writeln!(stdout)?;
                         self.history_index = None;
                         self.draft = None;
+                        self.vim_mode = VimMode::Insert;
+                        self.pending_key = None;
                         return Ok(ReadOutcome::Exit);
                     }
                 }
@@ -264,21 +360,27 @@ impl LineEditor {
 
     #[allow(clippy::too_many_lines)]
     fn handle_key(&mut self, key: KeyEvent, input: &mut InputBuffer) -> EditorAction {
-        match key {
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers,
-                ..
-            } if modifiers.contains(KeyModifiers::CONTROL) => {
-                if input.as_str().is_empty() {
-                    EditorAction::Exit
-                } else {
-                    input.clear();
-                    self.history_index = None;
-                    self.draft = None;
-                    EditorAction::Cancel
-                }
+        // Ctrl+C always works regardless of mode
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if input.as_str().is_empty() {
+                return EditorAction::Exit;
             }
+            input.clear();
+            self.vim_mode = VimMode::Insert;
+            self.pending_key = None;
+            self.history_index = None;
+            self.draft = None;
+            return EditorAction::Cancel;
+        }
+
+        match self.vim_mode {
+            VimMode::Insert => self.handle_key_insert(key, input),
+            VimMode::Normal => self.handle_key_normal(key, input),
+        }
+    }
+
+    fn handle_key_insert(&mut self, key: KeyEvent, input: &mut InputBuffer) -> EditorAction {
+        match key {
             KeyEvent {
                 code: KeyCode::Char('j'),
                 modifiers,
@@ -336,7 +438,9 @@ impl LineEditor {
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => {
-                input.complete_slash_command(&self.completions);
+                if !input.complete_file_reference() {
+                    input.complete_slash_command(&self.completions);
+                }
                 EditorAction::Continue
             }
             KeyEvent {
@@ -355,10 +459,9 @@ impl LineEditor {
             KeyEvent {
                 code: KeyCode::Esc, ..
             } => {
-                input.clear();
-                self.history_index = None;
-                self.draft = None;
-                EditorAction::Cancel
+                self.vim_mode = VimMode::Normal;
+                self.pending_key = None;
+                EditorAction::Continue
             }
             KeyEvent {
                 code: KeyCode::Char(ch),
@@ -371,6 +474,211 @@ impl LineEditor {
                 EditorAction::Continue
             }
             _ => EditorAction::Continue,
+        }
+    }
+
+    fn handle_key_normal(&mut self, key: KeyEvent, input: &mut InputBuffer) -> EditorAction {
+        // Ctrl+J inserts newline in any mode
+        if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.pending_key = None;
+            input.insert_newline();
+            return EditorAction::Continue;
+        }
+        // Arrow keys and other special keys work in normal mode too
+        match key {
+            // Mode switching
+            KeyEvent {
+                code: KeyCode::Char('i'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => {
+                self.vim_mode = VimMode::Insert;
+                self.pending_key = None;
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => {
+                input.move_right();
+                self.vim_mode = VimMode::Insert;
+                self.pending_key = None;
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('A'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+                input.move_end();
+                self.vim_mode = VimMode::Insert;
+                self.pending_key = None;
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('I'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+                input.move_home();
+                self.vim_mode = VimMode::Insert;
+                self.pending_key = None;
+                EditorAction::Continue
+            }
+            // Navigation
+            KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => {
+                self.pending_key = None;
+                input.move_left();
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => {
+                self.pending_key = None;
+                input.move_right();
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('0'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => {
+                self.pending_key = None;
+                input.move_home();
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('$'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+                self.pending_key = None;
+                input.move_end();
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('w'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => {
+                self.pending_key = None;
+                input.move_word_forward();
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => {
+                self.pending_key = None;
+                input.move_word_backward();
+                EditorAction::Continue
+            }
+            // Editing
+            KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => {
+                self.pending_key = None;
+                input.delete_char_at_cursor();
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('d'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => {
+                if self.pending_key == Some('d') {
+                    input.clear();
+                    self.pending_key = None;
+                } else {
+                    self.pending_key = Some('d');
+                }
+                EditorAction::Continue
+            }
+            // History
+            KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => {
+                self.pending_key = None;
+                self.navigate_history_down(input);
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers,
+                ..
+            } if modifiers.is_empty() => {
+                self.pending_key = None;
+                self.navigate_history_up(input);
+                EditorAction::Continue
+            }
+            // Arrow keys work in normal mode
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            } => {
+                self.pending_key = None;
+                input.move_left();
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } => {
+                self.pending_key = None;
+                input.move_right();
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => {
+                self.pending_key = None;
+                self.navigate_history_up(input);
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => {
+                self.pending_key = None;
+                self.navigate_history_down(input);
+                EditorAction::Continue
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
+                self.pending_key = None;
+                input.backspace();
+                EditorAction::Continue
+            }
+            // Enter submits in normal mode too
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => EditorAction::Submit,
+            // Esc in normal mode clears pending key
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                self.pending_key = None;
+                EditorAction::Continue
+            }
+            _ => {
+                self.pending_key = None;
+                EditorAction::Continue
+            }
         }
     }
 
@@ -417,23 +725,52 @@ impl LineEditor {
         input: &InputBuffer,
         previous_line_count: usize,
     ) -> io::Result<usize> {
-        let rendered = render_buffer(&self.prompt, &self.continuation_prompt, input);
-        if previous_line_count > 1 {
-            queue!(out, MoveUp(saturating_u16(previous_line_count - 1)))?;
+        let prompt = if self.vim_mode == VimMode::Normal {
+            ":"
+        } else {
+            &self.prompt
+        };
+        let rendered = render_buffer(prompt, &self.continuation_prompt, input);
+        let new_line_count = rendered.line_count();
+
+        if new_line_count == 1 && previous_line_count == 1 {
+            // Fast path: single-line input — no vertical cursor movement needed.
+            // Just carriage-return, clear the line, write, position cursor.
+            write!(out, "\r")?;
+            queue!(out, Clear(ClearType::CurrentLine))?;
+            rendered.write(out)?;
+            write!(out, "\r")?;
+            queue!(out, MoveToColumn(rendered.cursor_col))?;
+        } else {
+            // Multi-line path: move up, clear each old line, rewrite
+            if previous_line_count > 1 {
+                queue!(out, MoveUp(saturating_u16(previous_line_count - 1)))?;
+            }
+            for i in 0..previous_line_count {
+                if i > 0 {
+                    queue!(out, MoveDown(1))?;
+                }
+                queue!(out, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+            }
+            if previous_line_count > 1 {
+                queue!(out, MoveUp(saturating_u16(previous_line_count - 1)))?;
+            }
+            queue!(out, MoveToColumn(0))?;
+            rendered.write(out)?;
+            if new_line_count > 1 {
+                queue!(
+                    out,
+                    MoveUp(saturating_u16(new_line_count.saturating_sub(1))),
+                )?;
+            }
+            queue!(out, MoveToColumn(0))?;
+            if rendered.cursor_row > 0 {
+                queue!(out, MoveDown(rendered.cursor_row))?;
+            }
+            queue!(out, MoveToColumn(rendered.cursor_col))?;
         }
-        queue!(out, MoveToColumn(0), Clear(ClearType::FromCursorDown),)?;
-        rendered.write(out)?;
-        queue!(
-            out,
-            MoveUp(saturating_u16(rendered.line_count().saturating_sub(1))),
-            MoveToColumn(0),
-        )?;
-        if rendered.cursor_row > 0 {
-            queue!(out, MoveDown(rendered.cursor_row))?;
-        }
-        queue!(out, MoveToColumn(rendered.cursor_col))?;
         out.flush()?;
-        Ok(rendered.line_count())
+        Ok(new_line_count)
     }
 }
 
@@ -479,6 +816,44 @@ pub fn render_buffer(
         cursor_row,
         cursor_col,
     }
+}
+
+fn glob_files(pattern: &str) -> Vec<String> {
+    let path = std::path::Path::new(pattern);
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let file_prefix = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .trim_end_matches('*');
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let pattern_without_glob = pattern.trim_end_matches('*');
+    let mut results = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with(file_prefix) {
+            continue;
+        }
+        let full = if dir == std::path::Path::new(".") {
+            name_str.to_string()
+        } else {
+            format!("{}/{name_str}", dir.display())
+        };
+        if full.starts_with(pattern_without_glob) {
+            if entry.file_type().map_or(false, |t| t.is_dir()) {
+                results.push(format!("{full}/"));
+            } else {
+                results.push(full);
+            }
+        }
+    }
+    results.sort();
+    results
 }
 
 #[must_use]
