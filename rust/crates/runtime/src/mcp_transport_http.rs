@@ -73,22 +73,35 @@ async fn send_jsonrpc_request<TParams: serde::Serialize, TResult: serde::de::Des
     if (status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN)
         && config.can_refresh_token()
     {
-        if let Ok(()) = config.try_refresh_token().await {
-            let headers = config.authorize_request();
-            let mut req = client.post(&config.url).header("content-type", "application/json");
-            for (k, v) in &headers {
-                req = req.header(k, v);
+        match config.try_refresh_token().await {
+            Ok(()) => {
+                let headers = config.authorize_request();
+                let mut req = client.post(&config.url).header("content-type", "application/json");
+                for (k, v) in &headers {
+                    req = req.header(k, v);
+                }
+                let resp = req
+                    .json(request)
+                    .send()
+                    .await
+                    .map_err(|e| format!("{} retry failed: {e}", request.method))?;
+                return resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("{} retry parse failed: {e}", request.method));
             }
-            let resp = req
-                .json(request)
-                .send()
-                .await
-                .map_err(|e| format!("{} retry failed: {e}", request.method))?;
-            return resp
-                .json()
-                .await
-                .map_err(|e| format!("{} retry parse failed: {e}", request.method));
+            Err(refresh_error) => {
+                return Err(format!(
+                    "{} returned {} and token refresh failed: {refresh_error}",
+                    request.method, status
+                ));
+            }
         }
+    }
+
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("{} returned {status}: {body}", request.method));
     }
 
     resp.json()

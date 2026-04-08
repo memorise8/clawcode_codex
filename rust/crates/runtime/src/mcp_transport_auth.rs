@@ -117,7 +117,7 @@ impl RemoteTransportConfig {
             .as_deref()
             .ok_or("no refresh_token available")?;
 
-        let token_url = self.derive_token_url()?;
+        let token_url = self.derive_token_url().await?;
 
         let http = reqwest::Client::new();
         let response = http
@@ -178,13 +178,39 @@ impl RemoteTransportConfig {
         Ok(())
     }
 
-    fn derive_token_url(&self) -> Result<String, String> {
-        if let RemoteAuth::OAuth { ref auth_server_metadata_url, .. } = self.auth {
-            if let Some(url) = auth_server_metadata_url {
-                return Ok(url.clone());
-            }
+    /// Resolve the OAuth token endpoint by fetching the authorization server
+    /// metadata document (RFC 8414). The `auth_server_metadata_url` points to
+    /// a JSON document containing a `token_endpoint` field — NOT the token
+    /// endpoint itself.
+    async fn derive_token_url(&self) -> Result<String, String> {
+        let RemoteAuth::OAuth { ref auth_server_metadata_url, .. } = self.auth else {
+            return Err("not an OAuth config".to_string());
+        };
+        let metadata_url = auth_server_metadata_url.as_deref()
+            .ok_or("no auth_server_metadata_url configured for token refresh")?;
+
+        let http = reqwest::Client::new();
+        let response = http.get(metadata_url)
+            .send()
+            .await
+            .map_err(|e| format!("failed to fetch OAuth metadata from {metadata_url}: {e}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "OAuth metadata request to {metadata_url} returned {}",
+                response.status()
+            ));
         }
-        Err("no token endpoint configured (auth_server_metadata_url is required for token refresh)".to_string())
+
+        let metadata: serde_json::Value = response.json()
+            .await
+            .map_err(|e| format!("failed to parse OAuth metadata from {metadata_url}: {e}"))?;
+
+        metadata.get("token_endpoint")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("OAuth metadata at {metadata_url} missing token_endpoint field"))
     }
 }
 
