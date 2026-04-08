@@ -69,7 +69,13 @@ impl McpServerManager {
                 }
             })?;
 
-            transport.ensure_ready().await?;
+            if let Err(error) = transport.ensure_ready().await {
+                eprintln!(
+                    "warning: MCP server '{}' skipped during discovery: {error}",
+                    server_name
+                );
+                continue;
+            }
 
             // Clear existing routes for this server
             self.tool_index
@@ -85,31 +91,43 @@ impl McpServerManager {
                         }
                     })?;
 
-                let response = transport
+                let response = match transport
                     .list_tools(
                         request_id,
                         Some(McpListToolsParams {
                             cursor: cursor.clone(),
                         }),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(error) => {
+                        eprintln!(
+                            "warning: MCP server '{}' skipped during tool listing: {error}",
+                            server_name
+                        );
+                        break;
+                    }
+                };
 
                 if let Some(error) = response.error {
-                    return Err(McpServerManagerError::JsonRpc {
-                        server_name: server_name.clone(),
-                        method: "tools/list",
-                        error,
-                    });
+                    eprintln!(
+                        "warning: MCP server '{}' returned error during tool listing: {}",
+                        server_name, error.message
+                    );
+                    break;
                 }
 
-                let result =
-                    response
-                        .result
-                        .ok_or_else(|| McpServerManagerError::InvalidResponse {
-                            server_name: server_name.clone(),
-                            method: "tools/list",
-                            details: "missing result payload".to_string(),
-                        })?;
+                let result = match response.result {
+                    Some(r) => r,
+                    None => {
+                        eprintln!(
+                            "warning: MCP server '{}' returned empty result during tool listing",
+                            server_name
+                        );
+                        break;
+                    }
+                };
 
                 for tool in result.tools {
                     let qualified_name = mcp_tool_name(&server_name, &tool.name);
@@ -842,6 +860,57 @@ mod tests {
                 log.lines().collect::<Vec<_>>(),
                 vec!["initialize", "tools/list", "tools/call"]
             );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn discover_tools_skips_failing_transports() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("alpha.log");
+
+            // Build a config with a working stdio server AND an SSE server (which will fail ensure_ready)
+            let servers = BTreeMap::from([
+                (
+                    "alpha".to_string(),
+                    manager_server_config(&script_path, "alpha", &log_path),
+                ),
+                (
+                    "sse-server".to_string(),
+                    ScopedMcpServerConfig {
+                        scope: ConfigSource::Local,
+                        config: McpServerConfig::Sse(McpRemoteServerConfig {
+                            url: "https://example.test/sse".to_string(),
+                            headers: BTreeMap::new(),
+                            headers_helper: None,
+                            oauth: None,
+                        }),
+                    },
+                ),
+            ]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            // SSE is accepted as a transport (not unsupported)
+            assert!(
+                manager.unsupported_servers().is_empty(),
+                "SSE should be accepted as a transport, not unsupported"
+            );
+
+            // discover_tools must succeed despite SSE failing ensure_ready
+            let tools = manager.discover_tools().await.expect("discover_tools should not fail");
+
+            // The stdio server's tools are discovered
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].server_name, "alpha");
+            assert_eq!(tools[0].raw_name, "echo");
 
             manager.shutdown().await.expect("shutdown");
             cleanup_script(&script_path);

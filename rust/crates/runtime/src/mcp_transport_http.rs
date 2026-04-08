@@ -49,15 +49,18 @@ pub(crate) fn next_remote_request_id() -> JsonRpcId {
 
 use crate::mcp_transport::default_initialize_params;
 
+use crate::mcp_transport_auth::RemoteTransportConfig;
+
 /// Send a JSON-RPC request over HTTP and parse the typed response.
 async fn send_jsonrpc_request<TParams: serde::Serialize, TResult: serde::de::DeserializeOwned>(
-    url: &str,
-    headers: &BTreeMap<String, String>,
+    config: &RemoteTransportConfig,
     request: &JsonRpcRequest<TParams>,
 ) -> Result<JsonRpcResponse<TResult>, String> {
     let client = reqwest::Client::new();
-    let mut req = client.post(url).header("content-type", "application/json");
-    for (k, v) in headers {
+    let mut applied_headers = BTreeMap::new();
+    config.apply_headers(&mut applied_headers);
+    let mut req = client.post(&config.url).header("content-type", "application/json");
+    for (k, v) in &applied_headers {
         req = req.header(k, v);
     }
     let resp = req
@@ -72,13 +75,14 @@ async fn send_jsonrpc_request<TParams: serde::Serialize, TResult: serde::de::Des
 
 /// Fire-and-forget a JSON-RPC notification over HTTP (no response expected).
 async fn send_jsonrpc_notification(
-    url: &str,
-    headers: &BTreeMap<String, String>,
+    config: &RemoteTransportConfig,
     notification: &serde_json::Value,
 ) {
     let client = reqwest::Client::new();
-    let mut req = client.post(url).header("content-type", "application/json");
-    for (k, v) in headers {
+    let mut applied_headers = BTreeMap::new();
+    config.apply_headers(&mut applied_headers);
+    let mut req = client.post(&config.url).header("content-type", "application/json");
+    for (k, v) in &applied_headers {
         req = req.header(k, v);
     }
     let _ = req.json(notification).send().await;
@@ -87,30 +91,33 @@ async fn send_jsonrpc_notification(
 #[derive(Debug)]
 pub(crate) struct HttpTransportClient {
     server_name: String,
-    url: String,
-    headers: BTreeMap<String, String>,
+    config: RemoteTransportConfig,
     initialized: bool,
 }
 
 impl HttpTransportClient {
     #[cfg(test)]
     pub fn new(server_name: String, url: String, headers: BTreeMap<String, String>) -> Self {
+        use crate::mcp_transport_auth::RemoteAuth;
         Self {
             server_name,
-            url,
-            headers,
+            config: RemoteTransportConfig {
+                url,
+                headers,
+                auth: RemoteAuth::None,
+                headers_helper: None,
+            },
             initialized: false,
         }
     }
 
     pub fn from_config(
         server_name: String,
-        config: crate::mcp_transport_auth::RemoteTransportConfig,
+        config: RemoteTransportConfig,
     ) -> Self {
         Self {
             server_name,
-            url: config.url,
-            headers: config.headers,
+            config,
             initialized: false,
         }
     }
@@ -137,10 +144,10 @@ impl HttpTransportClient {
                 }
             })),
         );
-        let _: JsonRpcResponse = send_jsonrpc_request(&self.url, &self.headers, &init_request).await?;
+        let _: JsonRpcResponse = send_jsonrpc_request(&self.config, &init_request).await?;
 
         let notif = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        send_jsonrpc_notification(&self.url, &self.headers, &notif).await;
+        send_jsonrpc_notification(&self.config, &notif).await;
 
         self.initialized = true;
         Ok(())
@@ -152,7 +159,7 @@ impl HttpTransportClient {
         params: Option<McpListToolsParams>,
     ) -> Result<JsonRpcResponse<McpListToolsResult>, String> {
         let request = JsonRpcRequest::new(id, "tools/list", params);
-        send_jsonrpc_request(&self.url, &self.headers, &request).await
+        send_jsonrpc_request(&self.config, &request).await
     }
 
     pub async fn call_tool(
@@ -161,7 +168,7 @@ impl HttpTransportClient {
         params: McpToolCallParams,
     ) -> Result<JsonRpcResponse<McpToolCallResult>, String> {
         let request = JsonRpcRequest::new(id, "tools/call", Some(params));
-        send_jsonrpc_request(&self.url, &self.headers, &request).await
+        send_jsonrpc_request(&self.config, &request).await
     }
 
     pub async fn shutdown(&mut self) -> Result<(), String> {
