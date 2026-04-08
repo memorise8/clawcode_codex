@@ -52,15 +52,15 @@ use crate::mcp_transport::default_initialize_params;
 use crate::mcp_transport_auth::RemoteTransportConfig;
 
 /// Send a JSON-RPC request over HTTP and parse the typed response.
+/// On 401/403 with OAuth configured, attempts a single token refresh and retry.
 async fn send_jsonrpc_request<TParams: serde::Serialize, TResult: serde::de::DeserializeOwned>(
     config: &RemoteTransportConfig,
     request: &JsonRpcRequest<TParams>,
 ) -> Result<JsonRpcResponse<TResult>, String> {
     let client = reqwest::Client::new();
-    let mut applied_headers = BTreeMap::new();
-    config.apply_headers(&mut applied_headers);
+    let headers = config.authorize_request();
     let mut req = client.post(&config.url).header("content-type", "application/json");
-    for (k, v) in &applied_headers {
+    for (k, v) in &headers {
         req = req.header(k, v);
     }
     let resp = req
@@ -68,6 +68,29 @@ async fn send_jsonrpc_request<TParams: serde::Serialize, TResult: serde::de::Des
         .send()
         .await
         .map_err(|e| format!("{} failed: {e}", request.method))?;
+
+    let status = resp.status();
+    if (status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN)
+        && config.can_refresh_token()
+    {
+        if let Ok(()) = config.try_refresh_token().await {
+            let headers = config.authorize_request();
+            let mut req = client.post(&config.url).header("content-type", "application/json");
+            for (k, v) in &headers {
+                req = req.header(k, v);
+            }
+            let resp = req
+                .json(request)
+                .send()
+                .await
+                .map_err(|e| format!("{} retry failed: {e}", request.method))?;
+            return resp
+                .json()
+                .await
+                .map_err(|e| format!("{} retry parse failed: {e}", request.method));
+        }
+    }
+
     resp.json()
         .await
         .map_err(|e| format!("{} parse failed: {e}", request.method))
@@ -79,10 +102,9 @@ async fn send_jsonrpc_notification(
     notification: &serde_json::Value,
 ) {
     let client = reqwest::Client::new();
-    let mut applied_headers = BTreeMap::new();
-    config.apply_headers(&mut applied_headers);
+    let headers = config.authorize_request();
     let mut req = client.post(&config.url).header("content-type", "application/json");
-    for (k, v) in &applied_headers {
+    for (k, v) in &headers {
         req = req.header(k, v);
     }
     let _ = req.json(notification).send().await;
