@@ -2983,6 +2983,7 @@ impl ApiClient for OllamaRuntimeClient {
             // Accumulate tool calls by index
             let mut pending_tool_calls: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
             // (id, name, arguments)
+            let mut in_reasoning = false;
 
             while let Some(chunk) = stream
                 .next_chunk()
@@ -2990,23 +2991,33 @@ impl ApiClient for OllamaRuntimeClient {
                 .map_err(|error| RuntimeError::new(error.to_string()))?
             {
                 if let Some(choice) = chunk.choices.first() {
-                    // Text content — check both content and reasoning fields.
-                    // Gemma 4 streams thinking tokens in `reasoning` with empty `content`,
-                    // then sends the final answer in `content`.
-                    let text = choice.delta.content.as_deref().unwrap_or("");
+                    // Reasoning tokens (Gemma 4 thinking) — show dimmed
                     let reasoning = choice.delta.reasoning.as_deref().unwrap_or("");
-                    let delta_text = if !text.is_empty() {
-                        text
-                    } else if !reasoning.is_empty() {
-                        reasoning
-                    } else {
-                        ""
-                    };
-                    if !delta_text.is_empty() {
-                        write!(stdout, "{delta_text}")
+                    if !reasoning.is_empty() {
+                        if !in_reasoning {
+                            write!(stdout, "\x1b[2m💭 ")
+                                .and_then(|()| stdout.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            in_reasoning = true;
+                        }
+                        write!(stdout, "{reasoning}")
                             .and_then(|()| stdout.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        events.push(AssistantEvent::TextDelta(delta_text.to_string()));
+                    }
+
+                    // Final answer content
+                    let text = choice.delta.content.as_deref().unwrap_or("");
+                    if !text.is_empty() {
+                        if in_reasoning {
+                            write!(stdout, "\x1b[0m\n\n")
+                                .and_then(|()| stdout.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            in_reasoning = false;
+                        }
+                        write!(stdout, "{text}")
+                            .and_then(|()| stdout.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        events.push(AssistantEvent::TextDelta(text.to_string()));
                     }
 
                     // Tool call deltas
