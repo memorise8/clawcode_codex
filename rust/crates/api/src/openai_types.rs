@@ -131,6 +131,10 @@ pub struct ChatDelta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Gemma 4 / reasoning models emit thinking tokens in this field
+    /// while `content` remains empty until the final answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatDeltaToolCall>>,
 }

@@ -1251,14 +1251,40 @@ impl LiveCli {
                 self.mcp_tools.len()
             )
         };
-        format!(
-            "\x1b[38;5;196m\
+        let (logo, emoji) = match self.provider {
+            Provider::Anthropic => (
+                "\x1b[38;5;196m\
  ██████╗██╗      █████╗ ██╗    ██╗\n\
 ██╔════╝██║     ██╔══██╗██║    ██║\n\
 ██║     ██║     ███████║██║ █╗ ██║\n\
 ██║     ██║     ██╔══██║██║███╗██║\n\
 ╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
+ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m",
+                "🦞",
+            ),
+            Provider::OpenAi => (
+                "\x1b[38;5;40m\
+ ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗\n\
+██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝\n\
+██║     ██║   ██║██║  ██║█████╗   ╚███╔╝\n\
+██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗\n\
+╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗\n\
+ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝\x1b[0m",
+                "🤖",
+            ),
+            Provider::Ollama => (
+                "\x1b[38;5;33m\
+ ██████╗ ███████╗███╗   ███╗███╗   ███╗ █████╗\n\
+██╔════╝ ██╔════╝████╗ ████║████╗ ████║██╔══██╗\n\
+██║  ███╗█████╗  ██╔████╔██║██╔████╔██║███████║\n\
+██║   ██║██╔══╝  ██║╚██╔╝██║██║╚██╔╝██║██╔══██║\n\
+╚██████╔╝███████╗██║ ╚═╝ ██║██║ ╚═╝ ██║██║  ██║\n\
+ ╚═════╝ ╚══════╝╚═╝     ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝\x1b[0m",
+                "🦙",
+            ),
+        };
+        format!(
+            "{logo} {emoji}\n\n\
   \x1b[2mModel\x1b[0m            {}\n\
   \x1b[2mProvider\x1b[0m         {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
@@ -2964,14 +2990,23 @@ impl ApiClient for OllamaRuntimeClient {
                 .map_err(|error| RuntimeError::new(error.to_string()))?
             {
                 if let Some(choice) = chunk.choices.first() {
-                    // Text content
-                    if let Some(ref content) = choice.delta.content {
-                        if !content.is_empty() {
-                            write!(stdout, "{content}")
-                                .and_then(|()| stdout.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            events.push(AssistantEvent::TextDelta(content.clone()));
-                        }
+                    // Text content — check both content and reasoning fields.
+                    // Gemma 4 streams thinking tokens in `reasoning` with empty `content`,
+                    // then sends the final answer in `content`.
+                    let text = choice.delta.content.as_deref().unwrap_or("");
+                    let reasoning = choice.delta.reasoning.as_deref().unwrap_or("");
+                    let delta_text = if !text.is_empty() {
+                        text
+                    } else if !reasoning.is_empty() {
+                        reasoning
+                    } else {
+                        ""
+                    };
+                    if !delta_text.is_empty() {
+                        write!(stdout, "{delta_text}")
+                            .and_then(|()| stdout.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        events.push(AssistantEvent::TextDelta(delta_text.to_string()));
                     }
 
                     // Tool call deltas
