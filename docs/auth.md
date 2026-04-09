@@ -1,6 +1,6 @@
 # Authentication
 
-Claw Code supports two providers, each with multiple credential sources.
+Claw Code supports three providers, each with different credential sources.
 
 ## Anthropic (Claude)
 
@@ -54,7 +54,75 @@ Credentials are resolved in this order:
 claw --provider openai login
 ```
 
-Uses the same browser-based OAuth flow as the Anthropic provider, but targets OpenAI's authorization endpoints.
+This opens a browser to OpenAI's authorization page, starts a local callback server on port 4546, and exchanges the code for tokens. Tokens are stored in `~/.claude/credentials.json` under the `openai_oauth` key.
+
+### Logout
+
+```bash
+claw --provider openai logout
+```
+
+### Codex CLI Token Fallback
+
+If you have the Codex CLI installed (`~/.codex/auth.json`), Claw Code will automatically use those tokens as a last resort. This means `codex login` also works for Claw Code.
+
+## Ollama (Local LLMs)
+
+Ollama runs locally and requires **no authentication**. You just need a running Ollama instance.
+
+### Setup
+
+```bash
+# Install Ollama (if not installed)
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Pull a model
+ollama pull gemma4:31b-it-q4_K_M    # 31B dense (20GB, needs 24GB+ VRAM)
+ollama pull gemma4:e4b                # 4B edge (9.6GB, runs on most GPUs)
+ollama pull gemma4:e2b                # 2B edge (7.2GB, runs on CPU)
+```
+
+### Usage
+
+```bash
+claw --provider ollama                              # default: gemma4:31b-it-q4_K_M
+claw --provider ollama --model gemma4:e4b           # smaller model
+claw --provider ollama --model llama3:8b            # any Ollama model works
+```
+
+### Custom Ollama URL
+
+By default Claw Code connects to `http://localhost:11434`. To use a remote Ollama server or a different port:
+
+```bash
+OLLAMA_BASE_URL=http://gpu-server:11434 claw --provider ollama
+OLLAMA_BASE_URL=http://localhost:8080 claw --provider ollama
+```
+
+### Available Gemma 4 Models
+
+| Model | Size | Min VRAM | Best for |
+|-------|------|----------|----------|
+| `gemma4:e2b` | 7.2 GB | 8 GB RAM | Laptops, CPU-only |
+| `gemma4:e4b` | 9.6 GB | 16 GB | Consumer GPUs |
+| `gemma4:26b` | 18 GB | 24 GB | Workstations (MoE) |
+| `gemma4:31b-it-q4_K_M` | 20 GB | 24 GB | Data center GPUs |
+
+### GPU Selection
+
+If you have multiple GPUs, control which one Ollama uses:
+
+```bash
+# Start Ollama on a specific GPU
+CUDA_VISIBLE_DEVICES=2 ollama serve
+
+# Then connect from Claw Code
+claw --provider ollama
+```
+
+### Login / Logout
+
+`claw --provider ollama login` and `logout` are no-ops — Ollama does not use authentication.
 
 ## Credential Storage
 

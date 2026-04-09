@@ -4,7 +4,7 @@ A terminal-based AI coding assistant powered by Claude and OpenAI Codex.
 
 ## Features
 
-- Multi-provider: Anthropic Claude and OpenAI Codex
+- Multi-provider: Anthropic Claude, OpenAI Codex, and Ollama (local LLMs)
 - MCP server integration (stdio, HTTP, SSE)
 - OAuth authentication for both providers
 - Three permission modes: read-only, workspace-write, danger-full-access
@@ -24,9 +24,13 @@ cd rust && cargo build --release
 # Run with OpenAI Codex
 ./target/release/claw --provider openai
 
+# Run with Ollama (local Gemma 4 / any local LLM)
+./target/release/claw --provider ollama
+./target/release/claw --provider ollama --model gemma4:e4b
+
 # Login
-./target/release/claw login
-./target/release/claw --provider openai login
+./target/release/claw login                        # Anthropic
+./target/release/claw --provider openai login       # OpenAI Codex
 
 # One-shot prompt
 ./target/release/claw prompt "explain this codebase"
@@ -43,7 +47,7 @@ See [docs/config.md](docs/config.md) for details.
 
 ## Documentation
 
-- [Authentication](docs/auth.md) -- OAuth login, API keys, credential storage
+- [Authentication](docs/auth.md) -- OAuth login, API keys, Ollama setup, credential storage
 - [MCP Servers](docs/mcp.md) -- Transport types, configuration, auth
 - [Configuration](docs/config.md) -- Settings files, permissions, hooks
 - [Testing](docs/testing.md) -- Running tests, live E2E, CI
