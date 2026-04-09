@@ -21,6 +21,7 @@ use api::{
     resolve_openai_auth, read_openai_base_url, OpenAiClient,
     ResponsesRequest, ResponsesInput, ResponsesMessage, ResponsesContent, ResponsesTool,
     ResponsesFunctionCallInput, ResponsesFunctionCallOutputInput,
+    ChatCompletionRequest, ChatMessage, ChatTool, ChatFunction, ChatToolChoice,
 };
 
 use commands::{
@@ -54,6 +55,7 @@ const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 enum Provider {
     Anthropic,
     OpenAi,
+    Ollama,
 }
 
 impl Provider {
@@ -61,8 +63,9 @@ impl Provider {
         match value {
             "anthropic" | "claude" => Ok(Self::Anthropic),
             "openai" | "codex" => Ok(Self::OpenAi),
+            "ollama" | "local" | "gemma" => Ok(Self::Ollama),
             other => Err(format!(
-                "unsupported provider: {other} (expected: anthropic, claude, openai, codex)"
+                "unsupported provider: {other} (expected: anthropic, claude, openai, codex, ollama, local, gemma)"
             )),
         }
     }
@@ -71,6 +74,7 @@ impl Provider {
         match self {
             Self::Anthropic => DEFAULT_MODEL,
             Self::OpenAi => "codex-mini-latest",
+            Self::Ollama => "gemma4:31b-it-q4_K_M",
         }
     }
 }
@@ -517,6 +521,10 @@ fn run_login(provider: Provider) -> Result<(), Box<dyn std::error::Error>> {
     match provider {
         Provider::Anthropic => run_anthropic_login(),
         Provider::OpenAi => run_openai_login(),
+        Provider::Ollama => {
+            println!("Ollama does not require authentication. Ensure ollama is running locally.");
+            Ok(())
+        }
     }
 }
 
@@ -690,6 +698,9 @@ fn run_logout(provider: Provider) -> Result<(), Box<dyn std::error::Error>> {
         Provider::OpenAi => {
             clear_oauth_credentials_for_provider("openai_oauth")?;
             println!("OpenAI Codex OAuth credentials cleared.");
+        }
+        Provider::Ollama => {
+            println!("Ollama does not use stored credentials. Nothing to clear.");
         }
     }
     Ok(())
@@ -1230,6 +1241,7 @@ impl LiveCli {
         let provider_label = match self.provider {
             Provider::Anthropic => "Anthropic",
             Provider::OpenAi => "OpenAI Codex",
+            Provider::Ollama => "Ollama (local)",
         };
         let mcp_line = if self.mcp_tools.is_empty() {
             String::new()
@@ -1311,6 +1323,7 @@ impl LiveCli {
         match self.provider {
             Provider::Anthropic => self.run_prompt_json_anthropic(input),
             Provider::OpenAi => self.run_prompt_json_openai(input),
+            Provider::Ollama => self.run_prompt_json_ollama(input),
         }
     }
 
@@ -1399,6 +1412,49 @@ impl LiveCli {
             }
             Ok::<_, api::ApiError>((text, input_tokens, output_tokens))
         })?;
+        println!(
+            "{}",
+            json!({
+                "message": text,
+                "model": self.model,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                }
+            })
+        );
+        Ok(())
+    }
+
+    fn run_prompt_json_ollama(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let base_url = env::var("OLLAMA_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+        let client = OpenAiClient::new("ollama").with_base_url(base_url);
+        let request = ChatCompletionRequest {
+            model: self.model.clone(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(input.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            max_tokens: None,
+            stream_options: None,
+        };
+        let runtime = tokio::runtime::Runtime::new()?;
+        let response = runtime.block_on(client.send_chat_completion(&request))?;
+        let text = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_deref())
+            .unwrap_or("");
+        let (input_tokens, output_tokens) = response
+            .usage
+            .map(|u| (u.prompt_tokens, u.completion_tokens))
+            .unwrap_or((0, 0));
         println!(
             "{}",
             json!({
@@ -1819,6 +1875,7 @@ fn prompt_json_backend(provider: Provider) -> &'static str {
     match provider {
         Provider::Anthropic => "anthropic",
         Provider::OpenAi => "openai",
+        Provider::Ollama => "ollama",
     }
 }
 
@@ -2372,6 +2429,12 @@ fn build_runtime(
             allowed_tools.clone(),
             mcp_tools,
         )?),
+        Provider::Ollama => ProviderClient::Ollama(OllamaRuntimeClient::new(
+            model,
+            enable_tools,
+            allowed_tools.clone(),
+            mcp_tools,
+        )?),
     };
     Ok(ConversationRuntime::new(
         session,
@@ -2797,9 +2860,205 @@ impl ApiClient for OpenAiRuntimeClient {
     }
 }
 
+struct OllamaRuntimeClient {
+    runtime: tokio::runtime::Runtime,
+    client: OpenAiClient,
+    model: String,
+    enable_tools: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    mcp_tools: Vec<McpToolSpec>,
+}
+
+impl OllamaRuntimeClient {
+    fn new(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        mcp_tools: Vec<McpToolSpec>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let base_url = env::var("OLLAMA_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+        Ok(Self {
+            runtime: tokio::runtime::Runtime::new()?,
+            client: OpenAiClient::new("ollama").with_base_url(base_url),
+            model,
+            enable_tools,
+            allowed_tools,
+            mcp_tools,
+        })
+    }
+}
+
+impl ApiClient for OllamaRuntimeClient {
+    #[allow(clippy::too_many_lines)]
+    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let tools: Option<Vec<ChatTool>> = self.enable_tools.then(|| {
+            let mut tools: Vec<ChatTool> = filter_tool_specs(self.allowed_tools.as_ref())
+                .into_iter()
+                .map(|spec| ChatTool {
+                    kind: "function".to_string(),
+                    function: ChatFunction {
+                        name: spec.name.to_string(),
+                        description: Some(spec.description.to_string()),
+                        parameters: spec.input_schema,
+                    },
+                })
+                .collect();
+            for mcp in filter_mcp_tools(&self.mcp_tools, self.allowed_tools.as_ref()) {
+                tools.push(ChatTool {
+                    kind: "function".to_string(),
+                    function: ChatFunction {
+                        name: mcp.name,
+                        description: Some(mcp.description),
+                        parameters: mcp.input_schema,
+                    },
+                });
+            }
+            tools
+        });
+
+        let system_text = if request.system_prompt.is_empty() {
+            None
+        } else {
+            Some(request.system_prompt.join("\n\n"))
+        };
+
+        let mut messages = Vec::new();
+        if let Some(system) = system_text {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(system),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        messages.extend(convert_to_chat_messages(&request.messages));
+
+        let chat_request = ChatCompletionRequest {
+            model: self.model.clone(),
+            messages,
+            tools,
+            tool_choice: self.enable_tools.then(|| ChatToolChoice::Mode("auto".to_string())),
+            stream: true,
+            max_tokens: None,
+            stream_options: None,
+        };
+
+        self.runtime.block_on(async {
+            let mut stream = self
+                .client
+                .stream_chat_completion(&chat_request)
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let mut stdout = io::stdout();
+            let mut events = Vec::new();
+            let mut saw_stop = false;
+
+            // Accumulate tool calls by index
+            let mut pending_tool_calls: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+            // (id, name, arguments)
+
+            while let Some(chunk) = stream
+                .next_chunk()
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?
+            {
+                if let Some(choice) = chunk.choices.first() {
+                    // Text content
+                    if let Some(ref content) = choice.delta.content {
+                        if !content.is_empty() {
+                            write!(stdout, "{content}")
+                                .and_then(|()| stdout.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            events.push(AssistantEvent::TextDelta(content.clone()));
+                        }
+                    }
+
+                    // Tool call deltas
+                    if let Some(ref tool_calls) = choice.delta.tool_calls {
+                        for tc in tool_calls {
+                            let entry = pending_tool_calls
+                                .entry(tc.index)
+                                .or_insert_with(|| (String::new(), String::new(), String::new()));
+                            if let Some(ref id) = tc.id {
+                                entry.0 = id.clone();
+                            }
+                            if let Some(ref func) = tc.function {
+                                if let Some(ref name) = func.name {
+                                    entry.1 = name.clone();
+                                }
+                                if let Some(ref args) = func.arguments {
+                                    entry.2.push_str(args);
+                                }
+                            }
+                        }
+                    }
+
+                    // Finish reason
+                    if let Some(ref reason) = choice.finish_reason {
+                        match reason.as_str() {
+                            "stop" | "tool_calls" => {
+                                // Flush pending tool calls
+                                for (_idx, (id, name, arguments)) in std::mem::take(&mut pending_tool_calls) {
+                                    if !name.is_empty() {
+                                        writeln!(
+                                            stdout,
+                                            "\n{}",
+                                            format_tool_call_start(&name, &arguments)
+                                        )
+                                        .and_then(|()| stdout.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                        events.push(AssistantEvent::ToolUse {
+                                            id,
+                                            name,
+                                            input: arguments,
+                                        });
+                                    }
+                                }
+                                saw_stop = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Usage
+                if let Some(ref usage) = chunk.usage {
+                    events.push(AssistantEvent::Usage(TokenUsage {
+                        input_tokens: usage.prompt_tokens,
+                        output_tokens: usage.completion_tokens,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }));
+                }
+            }
+
+            if !saw_stop && !events.is_empty() {
+                // Flush remaining pending tool calls
+                for (_idx, (id, name, arguments)) in std::mem::take(&mut pending_tool_calls) {
+                    if !name.is_empty() {
+                        events.push(AssistantEvent::ToolUse {
+                            id,
+                            name,
+                            input: arguments,
+                        });
+                    }
+                }
+            }
+
+            if saw_stop || !events.is_empty() {
+                events.push(AssistantEvent::MessageStop);
+            }
+
+            Ok(events)
+        })
+    }
+}
+
 enum ProviderClient {
     Anthropic(AnthropicRuntimeClient),
     OpenAi(OpenAiRuntimeClient),
+    Ollama(OllamaRuntimeClient),
 }
 
 impl ApiClient for ProviderClient {
@@ -2807,6 +3066,7 @@ impl ApiClient for ProviderClient {
         match self {
             Self::Anthropic(client) => client.stream(request),
             Self::OpenAi(client) => client.stream(request),
+            Self::Ollama(client) => client.stream(request),
         }
     }
 }
@@ -3360,6 +3620,97 @@ fn convert_to_responses_input(
                             call_id: call_id.to_string(),
                             output: output.clone(),
                         }));
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fn convert_to_chat_messages(messages: &[ConversationMessage]) -> Vec<ChatMessage> {
+    let mut result = Vec::new();
+
+    for message in messages {
+        match message.role {
+            MessageRole::System | MessageRole::User => {
+                let text: String = message
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    result.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: Some(text),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+            }
+            MessageRole::Assistant => {
+                let mut text_parts = Vec::new();
+                let mut tool_calls = Vec::new();
+
+                for block in &message.blocks {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            if !text.is_empty() {
+                                text_parts.push(text.as_str());
+                            }
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            tool_calls.push(api::ChatToolCall {
+                                id: id.clone(),
+                                kind: "function".to_string(),
+                                function: api::ChatFunctionCall {
+                                    name: name.clone(),
+                                    arguments: input.clone(),
+                                },
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+
+                let content = if text_parts.is_empty() {
+                    None
+                } else {
+                    Some(text_parts.join("\n"))
+                };
+                let tc = if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                };
+
+                if content.is_some() || tc.is_some() {
+                    result.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content,
+                        tool_calls: tc,
+                        tool_call_id: None,
+                    });
+                }
+            }
+            MessageRole::Tool => {
+                for block in &message.blocks {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        output,
+                        ..
+                    } = block
+                    {
+                        result.push(ChatMessage {
+                            role: "tool".to_string(),
+                            content: Some(output.clone()),
+                            tool_calls: None,
+                            tool_call_id: Some(tool_use_id.clone()),
+                        });
                     }
                 }
             }
@@ -4115,7 +4466,9 @@ mod tests {
         // This test ensures the Provider enum dispatches correctly.
         assert_eq!(Provider::Anthropic.default_model(), DEFAULT_MODEL);
         assert_eq!(Provider::OpenAi.default_model(), "codex-mini-latest");
+        assert_eq!(Provider::Ollama.default_model(), "gemma4:31b-it-q4_K_M");
         assert_ne!(Provider::Anthropic.default_model(), Provider::OpenAi.default_model());
+        assert_ne!(Provider::Anthropic.default_model(), Provider::Ollama.default_model());
     }
 
     #[test]
@@ -4124,6 +4477,9 @@ mod tests {
         assert_eq!(Provider::parse("claude").unwrap(), Provider::Anthropic);
         assert_eq!(Provider::parse("openai").unwrap(), Provider::OpenAi);
         assert_eq!(Provider::parse("codex").unwrap(), Provider::OpenAi);
+        assert_eq!(Provider::parse("ollama").unwrap(), Provider::Ollama);
+        assert_eq!(Provider::parse("local").unwrap(), Provider::Ollama);
+        assert_eq!(Provider::parse("gemma").unwrap(), Provider::Ollama);
         assert!(Provider::parse("unknown").is_err());
     }
 
@@ -4173,10 +4529,15 @@ mod tests {
         // This tests the dispatch decision function directly.
         assert_eq!(super::prompt_json_backend(super::Provider::Anthropic), "anthropic");
         assert_eq!(super::prompt_json_backend(super::Provider::OpenAi), "openai");
+        assert_eq!(super::prompt_json_backend(super::Provider::Ollama), "ollama");
         // Verify exhaustive match — if a new provider is added, this test must be updated
         assert_ne!(
             super::prompt_json_backend(super::Provider::Anthropic),
             super::prompt_json_backend(super::Provider::OpenAi),
+        );
+        assert_ne!(
+            super::prompt_json_backend(super::Provider::Anthropic),
+            super::prompt_json_backend(super::Provider::Ollama),
         );
     }
 }
